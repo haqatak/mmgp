@@ -14,7 +14,7 @@ Requirements:
 
 First you need to install the module in your current project with:
 ```shell
-pip install mmgp==1.0.5
+pip install mmgp
 ```
 
 It is almost plug and play and just needs to be invoked from the main app just after the model pipeline has been created.
@@ -53,7 +53,9 @@ Please note that there should be always one model whose Id is 'transformer'. It 
 Becareful, lots of models use the T5 XXL as a text encoder. However, quite often their corresponding pipeline configurations point at the official Google T5 XXL repository 
 where there is a huge 40GB model to download and load. It is cumbersorme as it is a 32 bits model and contains the decoder part of T5 that is not used. 
 I suggest you use instead one of the 16 bits encoder only version available around, for instance:
-*text_encoder_2 = T5EncoderModel.from_pretrained("black-forest-labs/FLUX.1-dev", subfolder="text_encoder_2", torch_dtype=torch.float16)*
+```
+text_encoder_2 = T5EncoderModel.from_pretrained("black-forest-labs/FLUX.1-dev", subfolder="text_encoder_2", torch_dtype=torch.float16)
+```
 
 Sometime just providing the pipe won't be sufficient as you will need to change the content of the core model: 
 - For instance you may need to disable an existing CPU offload logic that already exists (such as manual calls to move tensors between cuda and the cpu)
