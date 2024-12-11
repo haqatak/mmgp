@@ -1,0 +1,11 @@
+LICENSE.md
+README.md
+pyproject.toml
+src/__init__.py
+src/_version.py
+src/mmgp.py
+src/mmgp.egg-info/PKG-INFO
+src/mmgp.egg-info/SOURCES.txt
+src/mmgp.egg-info/dependency_links.txt
+src/mmgp.egg-info/requires.txt
+src/mmgp.egg-info/top_level.txt
