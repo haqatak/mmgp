@@ -12,6 +12,7 @@ Requirements:
 - GPU: RTX 3090/ RTX 4090 (24 GB of VRAM)
 - RAM: minimum 48 GB, recommended 64 GB 
 
+## Usage 
 First you need to install the module in your current project with:
 ```shell
 pip install mmgp
@@ -27,13 +28,38 @@ It is almost plug and play and just needs to be invoked from the main app just a
 
 ```
   from mmgp import offload
-  offload.me(pipe)
+  offload.all(pipe)
 ```  
+
+## Options
 The 'transformer' model in the pipe contains usually the video or image generator is quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 
-If you have more than 64GB RAM you may want to enable RAM pinning with the option *pinInRAM = True*. You will get in return super fast loading / unloading of models
+You can specify a list of additional models string ids to quantize (for instance the text_encoder) using the optional argument *modelsToQuantize* for instance *modelsToQuantize = ["text_encoder_2"]*.This may be useful if you have less than 48 GB of RAM.
+
+Note that there is little advantage on the GPU / VRAM side to quantize text encoders as their inputs are usually quite light. 
+
+Conversely if you have more than 64GB of RAM you may want to enable RAM pinning with the option *pinInRAM = True*. You will get in return super fast loading / unloading of models
 (this can save significant time if the same pipeline is run multiple times in a row)
 
+In Summary, if you have:
+- Between 32 GB and 48 GB of RAM
+```
+  offload.all(pipe, modelsToQuantize = ["text_encoder_2"]) # for Flux models
+  #OR
+  offload.all(pipe, modelsToQuantize = ["text_encoder"]) # for HunyuanVideo models
+
+```  
+
+- Between 48 GB and 64 GB of RAM
+```
+  offload.all(pipe)
+```  
+- More than 64 GB of RAM
+```
+  offload.all(pipe), pinInRAM = True
+```
+
+## Special
 Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.\
 For instance :
 

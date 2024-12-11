@@ -13,10 +13,12 @@
 #   for instance: pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
 # 2) Once every potential Lora has been loaded and merged, add the following lines:
 #   from mmgp import offload
-#   offload.me(pipe)
-# The 'transformer' model that contains usually the video or image generator is quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option quantizeTransformer to False to turn off on the fly quantization.
-#
-# If you have more than 64GB RAM you may want to enable RAM pinning with the option pinInRAM = True. You will get in return super fast loading / unloading of models
+#   offload.all(pipe)
+# The 'transformer' model that contains usually the video or image generator is quantized on the fly by default to 8 bits so that it can fit into 24 GB of VRAM. 
+# If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option quantizeTransformer to False to turn off on the fly quantization.
+# You can specify a list of additional models string ids to quantize (for instance the text_encoder) using the optional argument modelsToQuantize. This may be useful if you have less than 48 GB of RAM.
+# Note that there is little advantage on the GPU / VRAM side to quantize text encoders as their inputs are usually quite light. 
+# Conversely if you have more than 64GB RAM you may want to enable RAM pinning with the option pinInRAM = True. You will get in return super fast loading / unloading of models
 # (this can save significant time if the same pipeline is run multiple times in a row)
 # 
 # Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.
@@ -263,7 +265,7 @@ class offload:
   
 
     @classmethod
-    def all(cls, pipe_or_dict_of_modules, quantizeTransformer = True, pinInRAM = False,  verbose = True):
+    def all(cls, pipe_or_dict_of_modules, quantizeTransformer = True, pinInRAM = False,  verbose = True, modelsToQuantize = None ):
         self = cls()
         self.verbose = verbose
         self.pinned_modules_data = {}
@@ -284,8 +286,12 @@ class offload:
         
         models = {k: v for k, v in pipe_or_dict_of_modules.items() if isinstance(v, torch.nn.Module)}
 
+        modelsToQuantize =  modelsToQuantize if modelsToQuantize is not None else []
+        if not isinstance(modelsToQuantize, list):
+            modelsToQuantize = [modelsToQuantize]
         if quantizeTransformer:
-            self.models_to_quantize = ["transformer"]
+            modelsToQuantize.append("transformer")
+        self.models_to_quantize = modelsToQuantize
  #       del  models["transformer"] # to test everything but the transformer that has a much longer loading
  #       models = { 'transformer': pipe_or_dict_of_modules["transformer"]} # to test only the transformer
         for model_id in models: 
