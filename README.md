@@ -1,4 +1,8 @@
-**------------------ Memory Management for the GPU Poor by DeepBeepMeep ------------------**
+
+<p align="center">
+  <H2>Memory Management for the GPU Poor by DeepBeepMeep</H2>	
+</p>
+
 
 This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -9,26 +13,40 @@ Requirements:
 - RAM: minimum 48 GB, recommended 64 GB 
 
 First you need to install the module in your current project with:
-*pip install mmgp==1.0.5*
+```shell
+pip install mmgp==1.0.5
+```
 
 It is almost plug and play and just needs to be invoked from the main app just after the model pipeline has been created.
-1) First make sure that the pipeline explictly loads the models in the CPU device 
-  for instance: pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
+1) First make sure that the pipeline explictly loads the models in the CPU device, for instance:
+```
+  pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
+```
+
 2) Once every potential Lora has been loaded and merged, add the following lines:
 
-  *from mmgp import offload*
-  *offload.me(pipe)*
-  
-The 'transformer' model that contains usually the video or image generator is quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
+```
+  from mmgp import offload
+  offload.me(pipe)
+```  
+The 'transformer' model in the pipe contains usually the video or image generator is quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 
 If you have more than 64GB RAM you may want to enable RAM pinning with the option *pinInRAM = True*. You will get in return super fast loading / unloading of models
 (this can save significant time if the same pipeline is run multiple times in a row)
 
-Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.
-
+Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.\
 For instance :
-for flux derived models: *pipe = { "text_encoder": clip, "text_encoder_2": t5, "transformer": model, "vae":ae }*
-for mochi: *pipe = { "text_encoder": self.text_encoder, "transformer": self.dit, "vae":self.decoder }*
+
+
+- for flux derived models: 
+```
+pipe = { "text_encoder": clip, "text_encoder_2": t5, "transformer": model, "vae":ae }
+```
+- for mochi: 
+```
+pipe = { "text_encoder": self.text_encoder, "transformer": self.dit, "vae":self.decoder }
+```
+
 
 Please note that there should be always one model whose Id is 'transformer'. It corresponds to the main image / video model which usually needs to be quantized (this is done on the fly by default when loading the model).
 
@@ -45,6 +63,6 @@ You are free to use my module for non commercial use as long you give me proper 
 
 Thanks to
 ---------
-Huggingface / accelerate for the hooking examples
-Huggingface / quanto for their very useful quantizer
-gau-nernst for his Pinnig RAM samples
+- Huggingface / accelerate for the hooking examples
+- Huggingface / quanto for their very useful quantizer
+- gau-nernst for his Pinnig RAM samples
