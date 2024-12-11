@@ -8,6 +8,9 @@ Requirements:
 - GPU: RTX 3090/ RTX 4090 (24 GB of VRAM)
 - RAM: minimum 48 GB, recommended 64 GB 
 
+First you need to install the module in your current project with:
+*pip install mmgp==1.0.5*
+
 It is almost plug and play and just needs to be invoked from the main app just after the model pipeline has been created.
 1) First make sure that the pipeline explictly loads the models in the CPU device 
   for instance: pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
