@@ -680,9 +680,9 @@ class offload:
         if (budgets!= None or budget >0) :
             self.async_transfers = True
 
-        #pinInRAM = True
+        pinInRAM = True
         # compile not working yet or slower
-        compile = False
+        compile = False # True
         #quantizeTransformer = False
         #self.async_transfers = False
         self.compile = compile
@@ -804,9 +804,6 @@ class offload:
                     p._data = p._data.pin_memory()
                     # fix quanto bug (that seems to have been fixed since&) that allows _scale to be float32 if the original weight was float32 
                     # (this may cause type mismatch between dequantified bfloat16 weights and float32 scales)
-                    if p._scale.dtype == torch.float32:
-                        pass
-
                     p._scale = p._scale.to(torch.bfloat16).pin_memory() if p._scale.dtype == torch.float32 else p._scale.pin_memory()
                     pinned_parameters_data[p]=[p._data, p._scale]
                 else:
@@ -872,13 +869,13 @@ class offload:
                             # we limit this check to the first level of blocks as quering the cuda cache is time consuming
                             self.hook_me_light(submodule, model_id, cur_blocks_name, submodule_method, context = submodule_name)
 
-                        # if compile and cur_blocks_name != None and model_id == "transformer" and "_blocks" in submodule_name:
-                        #     submodule.compile(mode="reduce-overhead" ) #mode= "max-autotune"     
+                        if compile and cur_blocks_name != None and model_id == "transformer" and "_blocks" in submodule_name:
+                             submodule.compile(mode="reduce-overhead" ) #mode= "max-autotune"     
 
                         current_size = self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
 
 
-        if compile:
+        if compile and False:
             if verboseLevel>=1:
                 print("Torch compilation started")
             torch._dynamo.config.cache_size_limit = 10000
@@ -943,7 +940,7 @@ class offload:
             info = "You have chosen a Medium speed profile that requires at least 32 GB of RAM and 24 GB of VRAM."
             return offload.all(pipe_or_dict_of_modules, pinInRAM= "transformer", modelsToQuantize= extra_mod_to_quantize ,  info = info, quantizeTransformer= quantizeTransformer)
         elif profile_no == profile_type.LowRAM_LowVRAM_Slow:
-            info = "You have chosen the Slowest profile that requires at least 32 GB of RAM and 12 GB of VRAM."
+            info = "You have chosen the Slow profile that requires at least 32 GB of RAM and 12 GB of VRAM."
             return offload.all(pipe_or_dict_of_modules, pinInRAM= "transformer", modelsToQuantize= extra_mod_to_quantize ,  budgets=budgets, info = info, quantizeTransformer= quantizeTransformer)
         elif profile_no == profile_type.VerylowRAM_LowVRAM_Slowest:
             budgets["transformer"] = 400
