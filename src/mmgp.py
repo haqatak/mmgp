@@ -680,7 +680,7 @@ class offload:
         if (budgets!= None or budget >0) :
             self.async_transfers = True
 
-        pinInRAM = True
+        #pinInRAM = True
         # compile not working yet or slower
         compile = False # True
         #quantizeTransformer = False
