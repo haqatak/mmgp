@@ -752,7 +752,7 @@ class offload:
                         p._scale = p._scale.to(torch.bfloat16) 
                     current_model_size +=  torch.numel(p._scale) * sizeofbfloat16
                     current_model_size +=  torch.numel(p._data) * sizeofbfloat16 / 2
-                    if pinInRAM and not already_loaded:
+                    if modelPinned and not already_loaded:
                         # Force flushing the lazy load so that reserved memory can be freed when we are ready to pin
                         p._scale = p._scale + 0
                         p._data = p._data + 0
@@ -760,7 +760,7 @@ class offload:
                     if p.data.dtype == torch.float32:
                         # convert any left overs float32 weight to bloat16 to divide by 2 the model memory footprint
                         p.data = p.data.to(torch.bfloat16)
-                    else:
+                    elif modelPinned:
                         # force reading the tensors from the disk by pretending to modify them
                         p.data = p.data + 0
 
@@ -774,7 +774,7 @@ class offload:
                     # force reading the tensors from the disk by pretending to modify them
                     b.data = b.data + 0
 
-                current_model_size +=  torch.numel(p.data) * p.data.element_size()
+                current_model_size +=  torch.numel(b.data) * b.data.element_size()
 
             if model_id not in self.models:
                 self.models[model_id] = current_model
