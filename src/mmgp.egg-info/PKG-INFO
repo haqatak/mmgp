@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: mmgp
-Version: 2.0.3
+Version: 3.0.0
 Summary: Memory Management for the GPU Poor
 Author-email: deepbeepmeep <deepbeepmeep@yahoo.com>
 License:                     GNU GENERAL PUBLIC LICENSE
@@ -11,10 +11,12 @@ License-File: LICENSE.md
 Requires-Dist: torch>=2.1.0
 Requires-Dist: optimum-quanto
 Requires-Dist: accelerate
+Requires-Dist: safetensors
+Requires-Dist: psutil
 
 
 <p align="center">
-  <H2>Memory Management 2.0 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.0 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -26,15 +28,16 @@ Requirements:
 - VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090) 
 - RAM: minimum 24 GB, recommended 48 GB 
 
-This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (32 GB of RAM and 12 VRAM) and to run it at a very good speed on a high end consumer config (48 GB of RAM and 24 GB of VRAM).
+This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (32 GB of RAM and 12 VRAM) and to run it at a very good speed on a high end consumer config (48 GB of RAM and 24 GB of VRAM).\
+These RAM requirements are for Linux systems. Due to different memory management Windows will require an extra 16 GB of RAM to run the corresponding profile.
 
 Each profile may use the following: 
-- Smart preloading of models in RAM to reduce RAM requirements
+- Low RAM consumption (thanks to a rewritten safetensors library) that allows low RAM on the fly quantization
 - Smart automated loading / unloading of models in the GPU to avoid unloading models that may be needed again soon
 - Smart slicing of models to reduce memory occupied by models in the VRAM
-- Ability to pin models in reserved RAM to accelerate transfers to VRAM
+- Ability to pin models to reserved RAM to accelerate transfers to VRAM
 - Async transfers to VRAM to avoid a pause when loading a new slice of a model
-- Automated on the fly quantization or ability to load quantized models
+- Automated on the fly quantization or ability to load pre quantized models
 
 ## Installation
 First you need to install the module in your current project with:
@@ -67,33 +70,48 @@ You can choose between 5 profiles depending on your hardware:
 
 By default the 'transformer' will be quantized to 8 bits for all profiles. If you don't want that you may specify the optional parameter *quantizeTransformer = False*.
 
+Every parameter set automatically by a profile can be overridden with one or multiple parameters accepted by *offload.all* (see below):
+```
+  from mmgp import offload, profile_type
+  offload.profile(pipe, profile_type.HighRAM_LowVRAM_Fast, budgets = 1000)
+```
+If you want to know which parameter are set by one specific profile you can use the parameter *verboseLevel=2*
+
 ## Alternatively you may want to create your own profile with specific parameters:
 
 For example:
 ```
   from mmgp import offload
-  offload.all(pipe, pinInRAM=True, modelsToQuantize = ["text_encoder_2"] )
+  offload.all(pipe, pinnedMemory=True, ExtraModelsToQuantize = ["text_encoder_2"] )
 ```  
-- pinInRAM: Boolean (for all models) or List of models ids to pin in RAM. Every model pinned in RAM will load much faster (4 times) but this requires more RAM
-- modelsToQuantize: list of model ids to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
+- pinnedMemory: Boolean (for all models) or List of models ids to pin to RAM. Every model pinned to RAM will load much faster (up to 2 times) but this requires more RAM
 - quantizeTransformer: boolean by default True. The 'transformer' model in the pipe contains usually the video or image generator is by defaut; quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. If you don't want to quantize the image generator, you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
-- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the budget in VRAM (in fact the real number is 2.5 this number) that is allocated in VRAM for each model. The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. Turning on the PinInRAM accelerates greatly (4x) small budgets but consumes usually 50% more RAM.
+- extraModelsToQuantize: list of additional modelids of models to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
+- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the budget in VRAM (in fact the real number is 1.5 this number or 2.5 if asyncTransfers are also enabled) that is allocated in VRAM for each model. 
+The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
+- asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
+- verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
+- perc_reserved_mem_max: a float below 0.5 (or 0 for auto), may be reduced to a lower number if any out of memory is triggered while using pinnedMemory
+- compile (experimental): list of model ids to compile, may accelerate processing (or not) depending on the type of GPU. As of 01/01/2025 it will work only on Linux since compilation relies on Triton which is not yet supported on Windows
 
+If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization (especially on Windows) as due to the way safetensors work almost twice the amount of RAM  may be needed for the loading of the model.
 
 ##  Going further
 
 The module includes several tools to package a light version of your favorite video / image generator:
 - *save_model(model, file_path, do_quantize = False, quantization_type = qint8 )*\
 Save tensors of a model already loaded in memory in a safetensor format (much faster to reload). You can save it in a quantized format (default qint8 quantization recommended).
-If the model is saved in a quantized format, an extra file that ends with '_map.json' will be created and needed to reload the model again.
+The resulting safetensor file will contain extra fields in its metadata such as the quantization map and its configuration, so you will be able to move the file around without files such as *config.json* or *file_map.json*.
+You will need *load_model_data* or *fast_load_transformers_model* to read the file again . You may also load it using the default *safetensor* librar however you will need to provide in the same directory any complementary file that are usually requested (for instance *config.json*)
 
-- *load_model_data(model, file_path: str)*\
-Load the tensors data of a model in RAM of a model already initialized with no data. Detect and handle quantized models saved previously with save_model.
+- *load_model_data(model, file_path: str, do_quantize = False, quantization_type = qint8, pinToRAM = False, partialPin = False)*\
+Load the tensors data of a model in RAM of a model already initialized with no data. Detect and handle quantized models saved previously with *save_model*.A model can also be quantized on the fly while being loaded. The model which is loaded can be pinned to RAM while it is loaded, this is more RAM efficient than pinning tensors later using *offline.all* or *offline.profile*
 
-- *fast_load_transformers_model(model_path: str)*\
-Initialize (build the model hierarchy in memory) and fast load the corresponding tensors of a 'transformers' library model.
-The advantages over the original *from_pretrained* method is that the full model can fit into a single file with a filename of your choosing (thefore you can have multiple 'transformers' versions of the same model in the same directory) and prequantized model are processed in a transparent way.
-Please note that you need to keep the original file transformers 'config.json' in the same directory. 
+- *fast_load_transformers_model(model_path: str, do_quantize = False, quantization_type = qint8, pinToRAM = False, partialPin = False)*\
+Initialize (build the model hierarchy in memory) and fast load the corresponding tensors of a 'transformers' or 'diffusers' library model.
+The advantages over the original *from_pretrained* method is that a full model can fit into a single file with a filename of your choosing (thefore you can have multiple 'transformers' versions of the same model in the same directory) and prequantized models are processed in a transparent way. 
+Last but not least, you can also on the fly pin to RAM the whole model or the most important part of it (partialPin = True) in a more efficient way (faster and requires less RAM) than if you did through *offload.all* or *offload.profile*.
+
 
 
 The typical workflow wil be:

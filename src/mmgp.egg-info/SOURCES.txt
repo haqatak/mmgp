@@ -2,7 +2,9 @@ LICENSE.md
 README.md
 pyproject.toml
 src/__init__.py
-src/mmgp.py
+src/mmgp/__init__.py
+src/mmgp/offload.py
+src/mmgp/safetensors2.py
 src/mmgp.egg-info/PKG-INFO
 src/mmgp.egg-info/SOURCES.txt
 src/mmgp.egg-info/dependency_links.txt

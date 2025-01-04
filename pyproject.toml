@@ -1,6 +1,6 @@
 [project]
 name = "mmgp"
-version = "2.0.3"
+version = "3.0.0"
 authors = [
   { name = "deepbeepmeep", email = "deepbeepmeep@yahoo.com" },
 ]
@@ -11,6 +11,8 @@ license = { file = "LICENSE.md" }
 dependencies = [
   "torch >= 2.1.0",
   "optimum-quanto",
-  "accelerate"
+  "accelerate",
+  "safetensors",
+  "psutil"
 ]
 
