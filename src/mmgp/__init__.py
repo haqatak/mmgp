@@ -3,20 +3,20 @@ class profile_type(int, enum.Enum):
     @staticmethod
     def tostr(v):
         if v == 1:
-            s= "HighRAM_HighVRAM_Fastest" 
+            s= "HighRAM_HighVRAM" 
         elif v == 2:
-            s ="HighRAM_LowVRAM_Fast"
+            s ="HighRAM_LowVRAM"
         elif v == 3: 
-            s = "LowRAM_HighVRAM_Medium"
+            s = "LowRAM_HighVRAM"
         elif v == 4:
-            s = "LowRAM_LowVRAM_Slow"
+            s = "LowRAM_LowVRAM"
         else:
-            s = "VerylowRAM_LowVRAM_Slowest"
+            s = "VerylowRAM_LowVRAM"
         return s
     
-    HighRAM_HighVRAM_Fastest = 1
-    HighRAM_LowVRAM_Fast = 2
-    LowRAM_HighVRAM_Medium = 3
-    LowRAM_LowVRAM_Slow = 4
-    VerylowRAM_LowVRAM_Slowest = 5
+    HighRAM_HighVRAM  = 1
+    HighRAM_LowVRAM  = 2
+    LowRAM_HighVRAM  = 3
+    LowRAM_LowVRAM  = 4
+    VerylowRAM_LowVRAM  = 5
 

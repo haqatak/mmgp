@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: mmgp
-Version: 3.0.0
+Version: 3.0.3
 Summary: Memory Management for the GPU Poor
 Author-email: deepbeepmeep <deepbeepmeep@yahoo.com>
 License:                     GNU GENERAL PUBLIC LICENSE
@@ -28,16 +28,17 @@ Requirements:
 - VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090) 
 - RAM: minimum 24 GB, recommended 48 GB 
 
-This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (32 GB of RAM and 12 VRAM) and to run it at a very good speed on a high end consumer config (48 GB of RAM and 24 GB of VRAM).\
+This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (32 GB of RAM and 12 VRAM) and to run it at a very good speed (if not the best) on a high end consumer config (48 GB of RAM and 24 GB of VRAM).\
 These RAM requirements are for Linux systems. Due to different memory management Windows will require an extra 16 GB of RAM to run the corresponding profile.
 
-Each profile may use the following: 
+Each profile may use a combination of the following: 
 - Low RAM consumption (thanks to a rewritten safetensors library) that allows low RAM on the fly quantization
 - Smart automated loading / unloading of models in the GPU to avoid unloading models that may be needed again soon
 - Smart slicing of models to reduce memory occupied by models in the VRAM
 - Ability to pin models to reserved RAM to accelerate transfers to VRAM
 - Async transfers to VRAM to avoid a pause when loading a new slice of a model
 - Automated on the fly quantization or ability to load pre quantized models
+- support for pytorch compilation on Linux and WSL (not supported so far on pure Windows).
 
 ## Installation
 First you need to install the module in your current project with:
@@ -61,21 +62,27 @@ It is almost plug and play and just needs to be invoked from the main app just a
 ```
 
 You can choose between 5 profiles depending on your hardware:
-- HighRAM_HighVRAM_Fastest: at least 48 GB of RAM and 24 GB of VRAM : the fastest well suited for a RTX 3090 / RTX 4090
-- HighRAM_LowVRAM_Fast (recommended): at least 48 GB of RAM and 12 GB of VRAM : a bit slower, better suited for RTX 3070/3080/4070/4080 
-            or for RTX 3090 / RTX 4090 with large pictures batches or long videos
-- LowRAM_HighVRAM_Medium: at least 32 GB of RAM and 24 GB of VRAM : so so speed but adapted for RTX 3090 / RTX 4090 with limited RAM
-- LowRAM_LowVRAM_Slow: at least 32 GB of RAM and 12 GB of VRAM :  if have little VRAM or generate longer videos 
-- VerylowRAM_LowVRAM_Slowest: at least 24 GB of RAM and 10 GB of VRAM : if you don't have much it won't be fast but maybe it will work
+- HighRAM_HighVRAM  (1): at least 48 GB of RAM and 24 GB of VRAM : the fastest well suited for a RTX 3090 / RTX 4090 but consumes much more VRAM, adapted for fast shorter video or small batches of pictures
+- HighRAM_LowVRAM  (2): at least 48 GB of RAM and 12 GB of VRAM : a bit slower, better suited for RTX 3070/3080/4070/4080 or for RTX 3090 / RTX 4090 with large pictures batches or long videos
+- LowRAM_HighVRAM  (3): at least 32 GB of RAM and 24 GB of VRAM : adapted for RTX 3090 / RTX 4090 with limited RAM  but at the cost of VRAM (shorter videos / fewer images)
+- LowRAM_LowVRAM  (4): at least 32 GB of RAM and 12 GB of VRAM :  if you have little VRAM or want to generate longer videos / more images
+- VerylowRAM_LowVRAM  (5): at least 24 GB of RAM and 10 GB of VRAM : if you don't have much it won't be fast but maybe it will work
+
+Profile 2 (High RAM) and 4 (Low RAM)are the most recommended profiles since they are versatile (support for long videos for a slight performance cost).\
+If you use Flux derived applciation profile 1 and 3 will offer much faster generation times.
+In any case, a safe approach is to start from profile 5 (default profile) and then go down progressively to profile 4 and then to profile 2 as long as the app remains responsive or doesn't trigger any out of memory error.
 
 By default the 'transformer' will be quantized to 8 bits for all profiles. If you don't want that you may specify the optional parameter *quantizeTransformer = False*.
 
 Every parameter set automatically by a profile can be overridden with one or multiple parameters accepted by *offload.all* (see below):
 ```
   from mmgp import offload, profile_type
-  offload.profile(pipe, profile_type.HighRAM_LowVRAM_Fast, budgets = 1000)
+  offload.profile(pipe, profile_type.HighRAM_LowVRAM, budgets = 1000)
 ```
 If you want to know which parameter are set by one specific profile you can use the parameter *verboseLevel=2*
+
+**It is highly recommended to put the *from mmgp import offload, profile_type* at the top of your main python file (that is as the first import) so that all the existing safetensors calls are redirected to mmpg.**
+ 
 
 ## Alternatively you may want to create your own profile with specific parameters:
 
@@ -91,11 +98,10 @@ For example:
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
-- perc_reserved_mem_max: a float below 0.5 (or 0 for auto), may be reduced to a lower number if any out of memory is triggered while using pinnedMemory
-- compile (experimental): list of model ids to compile, may accelerate processing (or not) depending on the type of GPU. As of 01/01/2025 it will work only on Linux since compilation relies on Triton which is not yet supported on Windows
+- compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. As of 01/01/2025 it will work only on Linux or WSL since compilation relies on Triton which is not yet supported on Windows
 
-If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization (especially on Windows) as due to the way safetensors work almost twice the amount of RAM  may be needed for the loading of the model.
-
+If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization, it will be faster and consume slightly less RAM.
+ 
 ##  Going further
 
 The module includes several tools to package a light version of your favorite video / image generator:

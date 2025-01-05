@@ -1,3 +1,10 @@
+# ------------------ Safetensors2 1.0 by DeepBeepMeep (mmgp)------------------
+#
+# This module entirely written in Python is a replacement for the safetensor library which requires much less RAM to load models.
+# It can be conveniently used to keep a low RAM consumption when handling  transit data (for instance when quantizing or transferring tensors to reserver RAM)
+# You are free to use my module for non commercial use as long you give me proper credits. You may contact me on twitter @deepbeepmeep
+
+
 from typing import Optional, Dict, List, Iterator, Tuple
 from pathlib import Path
 import torch

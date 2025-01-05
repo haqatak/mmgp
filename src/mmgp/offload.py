@@ -4,7 +4,7 @@
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
 # times in a pipe (eg VAE).
 #
-# Requirements (for Linux, for Windows systems add 16 GB of RAM):
+# Requirements:
 # - VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090)
 # - RAM: minimum 24 GB, recommended 48 - 64 GB 
 # 
@@ -71,6 +71,8 @@ from optimum.quanto import freeze, qfloat8, qint8, quantize, QModuleMixin, QTens
 
 mmm = safetensors2.mmm
 
+default_verboseLevel = 1
+
 ONE_MB =  1048576
 sizeofbfloat16 = torch.bfloat16.itemsize
 sizeofint8 = torch.int8.itemsize
@@ -126,6 +128,11 @@ def move_tensors(obj, device):
     else:
         raise TypeError("Tensor or list / dict of tensors expected")
 
+def _compute_verbose_level(level):
+    if level <0:        
+        level = safetensors2.verboseLevel = default_verboseLevel
+    safetensors2.verboseLevel = level
+    return level
 
 def _get_max_reservable_memory(perc_reserved_mem_max):
     if perc_reserved_mem_max<=0:             
@@ -229,9 +236,9 @@ def _safetensors_load_file(file_path):
 def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_max = 0, verboseLevel = 1):
     if  verboseLevel>=1 :
         if partialPinning:
-            print(f"Partial pinning to RAM of data of '{model_id}'")
+            print(f"Partial pinning of data of '{model_id}' to reserved RAM")
         else:            
-            print(f"Pinning data to RAM of '{model_id}'")
+            print(f"Pinning data of '{model_id}' to reserved RAM")
 
     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
     if partialPinning:
@@ -253,6 +260,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
         if include:
             params_list = params_list +  list(sub_module.buffers(recurse=False)) + list(sub_module.parameters(recurse=False)) 
   
+    # print(f"num params to pin {model_id}: {len(params_list)}")
     for p in params_list:
         if isinstance(p, QTensor):
             length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
@@ -313,9 +321,9 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
 
     if verboseLevel >=1:
         if total_tensor_bytes == total:        
-            print(f"The whole model was pinned to RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+            print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
         else:
-            print(f"{total/ONE_MB:.2f} MB were pinned to RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
+            print(f"{total/ONE_MB:.2f} MB were pinned to reserved RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
 
     model._already_pinned = True
 
@@ -334,9 +342,9 @@ def _welcome():
 # def _pin_to_memory_sd(model, sd, model_id, partialPinning = False, perc_reserved_mem_max = 0, verboseLevel = 1):
 #     if  verboseLevel>=1 :
 #         if partialPinning:
-#             print(f"Partial pinning to RAM of data of file '{model_id}' while loading it")
+#             print(f"Partial pinning to reserved RAM of data of file '{model_id}' while loading it")
 #         else:            
-#             print(f"Pinning data to RAM of file '{model_id}' while loading it")
+#             print(f"Pinning data to reserved RAM of file '{model_id}' while loading it")
 
 #     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
 #     if partialPinning:
@@ -414,9 +422,9 @@ def _welcome():
 
 #     if verboseLevel >=1:
 #         if total_tensor_bytes == total:        
-#             print(f"The whole model was pinned to RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+#             print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
 #         else:
-#             print(f"{total/ONE_MB:.2f} MB were pinned to RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
+#             print(f"{total/ONE_MB:.2f} MB were pinned to reserved RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
 
 #     model._already_pinned = True
 
@@ -598,18 +606,18 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
 
     # force read non quantized parameters so that their lazy tensors and corresponding mmap are released
     # otherwise we may end up to keep in memory both the quantized and the non quantize model
-
-
-    for name, m in model_to_quantize.named_modules():
+    for m in model_to_quantize.modules():
         # do not read quantized weights (detected them directly or behind an adapter)
-        if isinstance(m, QModuleMixin) or hasattr(m, "base_layer") and  isinstance(m.base_layer, QModuleMixin):
-            pass
+        if isinstance(m, QModuleMixin) or hasattr(m, "base_layer") and  isinstance(m.base_layer, QModuleMixin): 
+            if hasattr(m, "bias") and m.bias is not None:
+                m.bias.data = m.bias.data + 0 
         else:
-            if hasattr(m, "weight") and m.weight is not None:
-                m.weight.data = m.weight.data + 0 
+            for n, p in m.named_parameters(recurse = False):
+                data = getattr(m, n)
+                setattr(m,n, torch.nn.Parameter(data + 0 ) )
 
-        if hasattr(m, "bias") and m.bias is not None:
-            m.bias.data = m.bias.data + 0 
+        for b in m.buffers(recurse = False):
+            b.data = b.data + 0 
 
     
     freeze(model_to_quantize)
@@ -634,6 +642,7 @@ class HfHook:
     def detach_hook(self, module):
         pass
 
+last_offload_obj = None
 class offload:
     def __init__(self):
         self.active_models = []
@@ -641,7 +650,6 @@ class offload:
         self.active_subcaches = {}        
         self.models = {}
         self.verboseLevel = 0
-        self.modules_data = {}
         self.blocks_of_modules = {}
         self.blocks_of_modules_sizes = {}
         self.anyCompiledModule = False
@@ -653,7 +661,9 @@ class offload:
         self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
         self.transfer_stream = torch.cuda.Stream()
         self.async_transfers = False
-
+        global last_offload_obj
+        last_offload_obj = self
+        
     def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name):
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
@@ -673,15 +683,16 @@ class offload:
 
 
         for k,p in submodule.named_parameters(recurse=False):
-            blocks_params.append(p)
             if isinstance(p, QTensor):
+                blocks_params.append( (submodule, k, p._data, p._scale) )
                 blocks_params_size += p._data.nbytes
                 blocks_params_size += p._scale.nbytes
             else:
+                blocks_params.append( (submodule, k, p.data, None) )
                 blocks_params_size += p.data.nbytes
 
-        for p in submodule.buffers(recurse=False):
-            blocks_params.append(p)      
+        for k, p in submodule.named_buffers(recurse=False):
+            blocks_params.append( (submodule, k, p.data, None) )
             blocks_params_size += p.data.nbytes
 
 
@@ -701,39 +712,34 @@ class offload:
 
     def gpu_load_blocks(self, model_id, blocks_name, async_load = False):
         # cl = clock.start()
-        import weakref
 
         if blocks_name != None:
             self.loaded_blocks[model_id] = blocks_name           
 
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+
         def cpu_to_gpu(stream_to_use, blocks_params, record_for_stream = None):
             with torch.cuda.stream(stream_to_use):
-                for p in blocks_params:
+                for param in blocks_params:
+                    parent_module, n, data, scale  = param
+                    p = getattr(parent_module, n)
                     if isinstance(p, QTensor):
-                        # need formal transfer to cuda otherwise quantized tensor will be still considered in cpu and compilation will fail 
-                        q=p.to("cuda",non_blocking=True)
-                        #q = torch.nn.Parameter(q , requires_grad=False)
-
-                        ref = weakref.getweakrefs(p)
-                        if ref:
-                            torch._C._swap_tensor_impl(p, q)
-                        else:
-                            torch.utils.swap_tensors(p, q)
-
-                        # p._data = p._data.cuda(non_blocking=True)             
-                        # p._scale = p._scale.cuda(non_blocking=True)
+                        q = WeightQBytesTensor.create(p.qtype, p.axis, p.size(), p.stride(), data.cuda(non_blocking=True), scale.cuda(non_blocking=True), activation_qtype=p.activation_qtype, requires_grad=p.requires_grad )
+                        #q = p.to("cuda", non_blocking=True)
+                        q = torch.nn.Parameter(q , requires_grad=False)
+                        setattr(parent_module, n , q)
+                        del p
                     else:
                         p.data = p.data.cuda(non_blocking=True) 
                     
                     if record_for_stream != None:
                         if isinstance(p, QTensor):
-                            p._data.record_stream(record_for_stream)
-                            p._scale.record_stream(record_for_stream)
+                            q._data.record_stream(record_for_stream)
+                            q._scale.record_stream(record_for_stream)
                         else:
                             p.data.record_stream(record_for_stream)
 
 
-        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         if self.verboseLevel >=2:
             model = self.models[model_id]
             model_name = model._get_name()
@@ -759,7 +765,6 @@ class offload:
 
     def gpu_unload_blocks(self, model_id, blocks_name):
         # cl = clock.start()
-        import weakref
         if blocks_name != None:
             self.loaded_blocks[model_id] = None 
 
@@ -771,26 +776,19 @@ class offload:
             print(f"Unloading model {blocks_name} ({model_name}) from GPU")
  
         blocks_params = self.blocks_of_modules[blocks_name]
-        if "transformer/double_blocks.0" == blocks_name:
-            pass
-        parameters_data = self.modules_data[model_id]
-        for p in blocks_params:
+
+        for param in blocks_params:
+            parent_module, n, data, scale = param
+            p = getattr(parent_module, n) 
             if isinstance(p, QTensor):
-                data = parameters_data[p]
-
-                # needs to create a new WeightQBytesTensor with the cached data that is in the cpu device like the data (faketensor p is still in cuda) 
-                q = WeightQBytesTensor.create(p.qtype, p.axis, p.size(), p.stride(), data[0], data[1], activation_qtype=p.activation_qtype, requires_grad=p.requires_grad )
-                #q = torch.nn.Parameter(q , requires_grad=False)
-                ref = weakref.getweakrefs(p)
-                if ref:
-                     torch._C._swap_tensor_impl(p, q)
-                else:
-                    torch.utils.swap_tensors(p, q)
-
-                # p._data = data[0]          
-                # p._scale = data[1]             
+                # need to change the parameter directly from the module as it can't be swapped in place due to a memory leak in the pytorch compiler
+                q = WeightQBytesTensor.create(p.qtype, p.axis, p.size(), p.stride(), data, scale, activation_qtype=p.activation_qtype, requires_grad=p.requires_grad )
+                q = torch.nn.Parameter(q , requires_grad=False)
+                setattr(parent_module, n , q)
+                del p
             else:
-                p.data = parameters_data[p]
+                p.data = data
+
         # cl.stop()
         # print(f"unload time: {cl.format_time_gap()}")
 
@@ -972,11 +970,13 @@ class offload:
     #     for module in parent_module.components.items():
     #         self.unhook_module(module)
 
-def fast_load_transformers_model(model_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False,  verbose_level = 1):
+def fast_load_transformers_model(model_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False,  verboseLevel = -1):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
     """       
+
+    
     import os.path
     from accelerate import init_empty_weights
  
@@ -984,6 +984,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         raise Exception("full model path to file expected")
 
     model_path = _get_model(model_path)
+    verboseLevel = _compute_verbose_level(verboseLevel)
 
     with safetensors2.safe_open(model_path) as f:
         metadata = f.metadata() 
@@ -1039,19 +1040,20 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantization_type = quantization_type, pinToMemory= pinToMemory, partialPinning= partialPinning, verboseLevel=verbose_level )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantization_type = quantization_type, pinToMemory= pinToMemory, partialPinning= partialPinning, verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False, verboseLevel = 1):
+def load_model_data(model, file_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
 
     file_path = _get_model(file_path)
-    safetensors2.verboseLevel = verboseLevel
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
     model = _remove_model_wrapper(model)
 
     # if pinToMemory and do_quantize:
@@ -1118,12 +1120,14 @@ def load_model_data(model, file_path: str, do_quantize = False, quantization_typ
 
     return
 
-def save_model(model, file_path, do_quantize = False, quantization_type = qint8, verboseLevel = 1 ):
+def save_model(model, file_path, do_quantize = False, quantization_type = qint8, verboseLevel = -1 ):
     """save the weights of a model and quantize them if requested
     These weights can be loaded again using 'load_model_data'
     """       
     
     config = None
+
+    verboseLevel = _compute_verbose_level(verboseLevel)
 
     if hasattr(model, "_config"):
         config = model._config
@@ -1156,7 +1160,7 @@ def save_model(model, file_path, do_quantize = False, quantization_type = qint8,
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = 1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -1200,6 +1204,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     models = {k: _remove_model_wrapper(v) for k, v in pipe_or_dict_of_modules.items() if isinstance(v, torch.nn.Module)}
 
     
+    verboseLevel = _compute_verbose_level(verboseLevel)
 
     _welcome()        
 
@@ -1233,6 +1238,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
     if self.anyCompiledModule:
         torch._dynamo.config.cache_size_limit = 10000
+      #  torch._logging.set_logs(recompiles=True)
+      #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
 
     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
 
@@ -1306,9 +1313,16 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                 print(f"Pytorch compilation of model '{model_id}' is scheduled.")
             for tower in towers_modules:
                 for submodel in tower:
-                    submodel.forward= torch.compile(submodel.forward, backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
-                    
+                    submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                    #dynamic=True,
                 
+        if pinAllModels or model_id in modelsToPin:
+            if hasattr(current_model,"_already_pinned"):
+                if self.verboseLevel >=1:
+                    print(f"Model '{model_id}' already pinned to reserved memory")
+            else:
+                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel)            
+
         for submodule_name, submodule in current_model.named_modules():  
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -1355,21 +1369,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                     current_size = self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
 
 
-        parameters_data = {}
-        if pinAllModels or model_id in modelsToPin:
-            if hasattr(current_model,"_already_pinned"):
-                if self.verboseLevel >=1:
-                    print(f"Model '{model_id}' already pinned to reserved memory")
-            else:
-                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel)            
 
-
-        for p in current_model.parameters():
-            parameters_data[p] = [p._data, p._scale] if isinstance(p, QTensor) else p.data 
-
-        buffers_data = {b: b.data for b in current_model.buffers()}
-        parameters_data.update(buffers_data)
-        self.modules_data[model_id]=parameters_data
 
     if self.verboseLevel >=2:
         for n,b in self.blocks_of_modules_sizes.items():
@@ -1382,7 +1382,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     return self
 
 
-def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.VerylowRAM_LowVRAM_Slowest , verboseLevel = 1, **overrideKwargs):
+def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.VerylowRAM_LowVRAM, verboseLevel = -1, **overrideKwargs):
     """Apply a configuration profile that depends on your hardware:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     profile_name : num of the profile:
@@ -1397,6 +1397,8 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     """      
 
     _welcome()
+
+    verboseLevel = _compute_verbose_level(verboseLevel)
 
     modules = pipe_or_dict_of_modules
 
@@ -1424,32 +1426,32 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
 
     default_budgets = { "transformer" : 600 , "text_encoder": 3000, "text_encoder_2": 3000 }
     extraModelsToQuantize = None
+    asyncTransfers = True
 
-    if profile_no == profile_type.HighRAM_HighVRAM_Fastest:
+    if profile_no == profile_type.HighRAM_HighVRAM:
         pinnedMemory= True
         budgets = None
-        info = "You have chosen a Very Fast profile that requires at least 48 GB of RAM and 24 GB of VRAM."
-    elif profile_no == profile_type.HighRAM_LowVRAM_Fast:
+        info = "You have chosen a profile that requires at least 48 GB of RAM and 24 GB of VRAM. Some VRAM is consuming just to make the model runs faster."
+    elif profile_no == profile_type.HighRAM_LowVRAM:
         pinnedMemory= True
         budgets = default_budgets
-        info = "You have chosen a Fast profile that requires at least 48 GB of RAM and 12 GB of VRAM."
-    elif profile_no == profile_type.LowRAM_HighVRAM_Medium:
+        info = "You have chosen a profile that requires at least 48 GB of RAM and 12 GB of VRAM. Some RAM is consumed to reduce VRAM consumption."
+    elif profile_no == profile_type.LowRAM_HighVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
-        info = "You have chosen a Medium speed profile that requires at least 32 GB of RAM and 24 GB of VRAM."
-    elif profile_no == profile_type.LowRAM_LowVRAM_Slow:
+        info = "You have chosen a Medium speed profile that requires at least 32 GB of RAM and 24 GB of VRAM. Some VRAM is consuming just to make the model runs faster"
+    elif profile_no == profile_type.LowRAM_LowVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets=default_budgets
-        asyncTransfers = True
-        info = "You have chosen the Slow profile that requires at least 32 GB of RAM and 12 GB of VRAM."
-    elif profile_no == profile_type.VerylowRAM_LowVRAM_Slowest:
+        info = "You have chosen a profile that requires at least 32 GB of RAM and 12 GB of VRAM. Some RAM is consumed to reduce VRAM consumption. "
+    elif profile_no == profile_type.VerylowRAM_LowVRAM:
         pinnedMemory= False
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets=default_budgets
         budgets["transformer"] = 400
         asyncTransfers = False
-        info = "You have chosen the Slowest profile that requires at least 24 GB of RAM and 10 GB of VRAM."
+        info = "You have chosen the slowest profile that requires at least 24 GB of RAM and 10 GB of VRAM."
     else:
         raise Exception("Unknown profile")
     CrLf = '\r\n'
