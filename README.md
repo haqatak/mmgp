@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.0 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.0.9 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -22,8 +22,9 @@ Each profile may use a combination of the following:
 - Ability to pin models to reserved RAM to accelerate transfers to VRAM
 - Async transfers to VRAM to avoid a pause when loading a new slice of a model
 - Automated on the fly quantization or ability to load pre quantized models
-- support for pytorch compilation on Linux and WSL (not supported so far on pure Windows).
-
+- Pretrained Lora support with low RAM requirements
+- Support for pytorch compilation on Linux and WSL (supported on pure Windows but requires a complex Triton Installation).
+- 
 ## Installation
 First you need to install the module in your current project with:
 ```shell
@@ -89,20 +90,22 @@ If you are short on RAM and plan to work with quantized models, it is recommende
 ##  Going further
 
 The module includes several tools to package a light version of your favorite video / image generator:
-- *save_model(model, file_path, do_quantize = False, quantization_type = qint8 )*\
+- *save_model(model, file_path, do_quantize = False, quantizationType = qint8 )*\
 Save tensors of a model already loaded in memory in a safetensor format (much faster to reload). You can save it in a quantized format (default qint8 quantization recommended).
 The resulting safetensor file will contain extra fields in its metadata such as the quantization map and its configuration, so you will be able to move the file around without files such as *config.json* or *file_map.json*.
 You will need *load_model_data* or *fast_load_transformers_model* to read the file again . You may also load it using the default *safetensor* librar however you will need to provide in the same directory any complementary file that are usually requested (for instance *config.json*)
 
-- *load_model_data(model, file_path: str, do_quantize = False, quantization_type = qint8, pinToRAM = False, partialPin = False)*\
+- *load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToRAM = False, partialPin = False)*\
 Load the tensors data of a model in RAM of a model already initialized with no data. Detect and handle quantized models saved previously with *save_model*.A model can also be quantized on the fly while being loaded. The model which is loaded can be pinned to RAM while it is loaded, this is more RAM efficient than pinning tensors later using *offline.all* or *offline.profile*
 
-- *fast_load_transformers_model(model_path: str, do_quantize = False, quantization_type = qint8, pinToRAM = False, partialPin = False)*\
+- *fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType = qint8, pinToRAM = False, partialPin = False)*\
 Initialize (build the model hierarchy in memory) and fast load the corresponding tensors of a 'transformers' or 'diffusers' library model.
 The advantages over the original *from_pretrained* method is that a full model can fit into a single file with a filename of your choosing (thefore you can have multiple 'transformers' versions of the same model in the same directory) and prequantized models are processed in a transparent way. 
 Last but not least, you can also on the fly pin to RAM the whole model or the most important part of it (partialPin = True) in a more efficient way (faster and requires less RAM) than if you did through *offload.all* or *offload.profile*.
 
-
+- *load_loras_into_model(model, lora_path, lora_multi)
+Load in a model a list of Lora described by a list of path *lora_path* and a list of *weights coefficients*.
+The Lora file must be in the *diffusers* format. This function works also on non diffusers models. However if there is already an official Lora support for a model it is recommended to use the official diffusers functions.
 
 The typical workflow wil be:
 1) temporarly insert the *save_model* function just after a model has been fully loaded to save a copy of the model / quantized model.

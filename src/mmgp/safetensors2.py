@@ -155,7 +155,7 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
            torch.bool : 'BOOL' ,  torch.float64 : 'F64' , torch.float32 : 'F32' , torch.float16 : 'F16', torch.float8_e5m2 : "F8_E5M2", torch.float8_e4m3fn: "F8_E4M3" }
     pos = 0
     i = 0
-    mx = 1000000
+    mx = 100000
     for k , t  in sd.items():
         entry = {}
         dtypestr= map[t.dtype]
@@ -186,8 +186,6 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
 
     length_of_header_bytes = struct.pack('<Q', size_header)
 
-    empty_tensor = b'\x80\x3f'
-
     with open(file_path, "wb") as writer:
         bytes_written = writer.write(length_of_header_bytes)        
         bytes_written = writer.write(header_bytes)        
@@ -195,12 +193,20 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
         i = 0
         for k , t  in sd.items():
             size = torch.numel(t) * t.element_size()
-            if len(t.shape) == 0:
-                bytes_written = writer.write(empty_tensor)
-            else:
-                buffer = t.view(torch.uint8).numpy().tobytes()
-                bytes_written = writer.write(buffer)
-            assert bytes_written == size
+            if size != 0:
+                if len(t.shape) == 0:
+                    dtype = t.dtype
+                    # convert in a friendly format, scalars types not supported by numpy
+                    if  dtype ==  torch.bfloat16:
+                        t = t.view(torch.uint16)
+                    elif  dtype ==  torch.float8_e5m2 or dtype ==  torch.float8_e4m3fn:
+                        t = t.view(torch.uint8)
+                    buffer = t.numpy().tobytes()
+                else:
+                    buffer = t.view(torch.uint8).numpy().tobytes()
+                bytes_written = writer.write(buffer)            
+                assert bytes_written == size
+                
             i+=1
             if i==mx:
                 break
@@ -208,7 +214,7 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
 class SafeTensorFile:
     """Main class for accessing safetensors files that provides memory-efficient access"""
     
-    def __init__(self, file_path, metadata, catalog, skip_bytes):
+    def __init__(self, file_path, metadata, catalog, skip_bytes, lazy_loading = True):
         self._file_path = file_path
         self._metadata = metadata
         self._catalog = catalog
@@ -216,20 +222,30 @@ class SafeTensorFile:
         self._keys = None
         self.sd = None
         self.mtracker = None
+        self.lazy_loading = lazy_loading
 
     @classmethod
-    def load_metadata(cls, file_path):    
+    def load_metadata(cls, file_path, lazy_loading = True):
         with open(file_path, 'rb') as f:
             catalog, metadata, skip_bytes = _read_safetensors_header(file_path, f)
 
-        return cls(file_path, metadata, catalog, skip_bytes)
+        return cls(file_path, metadata, catalog, skip_bytes, lazy_loading)
 
-    def init_tensors(self):
+    def init_tensors(self, lazyTensors = True):
         if self.sd is None:
-            self.sd = self.create_tensors()
+            self.lazy_loading = lazyTensors
+            if lazyTensors:
+                self.sd = self.create_tensors_with_mmap()
+            else:
+                self.sd = self.create_tensors_without_mmap()
+        # else:
+        #     if not self.lazy_loading and lazyTensors:
+        #         raise Exception("Every tensor should be either lazy loaded or not lazy loaded")
+
         return self.sd
     
-    def create_tensors(self):
+            
+    def create_tensors_with_mmap(self):
  
         self.mtracker = MmapTracker(self._file_path)
         import mmap
@@ -282,7 +298,12 @@ class SafeTensorFile:
                 map_idx = next(iter_tensor_no)
                 offset = current_pos - maps[map_idx][1]
                 if len(shape) == 0:
-                    t = torch.ones((), dtype=dtype, device="cpu")
+                    if length == 0: 
+                        t = torch.empty(0, dtype=dtype)
+                    else:
+                        # don't waste a memory view for a scalar
+                        t = torch.frombuffer(bytearray(maps[map_idx][0][offset:offset + length]), dtype=torch.uint8)
+                        t = t.view(dtype)                        
                 else:
                     mv = memoryview(maps[map_idx][0])[offset:offset + length]                
                     t = torch.frombuffer(mv, dtype=dtype)
@@ -293,8 +314,33 @@ class SafeTensorFile:
 
         return sd
 
+    def create_tensors_without_mmap(self):
+        sd = OrderedDict()    
+        
+        with open(self._file_path, 'rb') as f:
+            f.seek(self._skip_bytes, 0)
+            for k,v in self._catalog.items():
+                dtypestr =  v["dtype"]
+                dtype= _map_to_dtype[dtypestr]
+                shape = v["shape"]
+                data_offsets = v["data_offsets"]
+                length = data_offsets[1]-data_offsets[0]
+                buffer = f.read(length)
+                if len(shape) == 0:
+                    if length == 0: 
+                        t = torch.empty(0, dtype=dtype)
+                    else:
+                        t = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
+                        t = t.view(dtype)                        
+                else:
+                    t = torch.frombuffer(bytearray(buffer), dtype=dtype)
+                    t = torch.reshape(t, shape)
+                sd[k] = t
+        return sd
+
     def get_tensor(self, name: str) -> torch.tensor:
         """Get a tensor by name"""
+        # To do : switch to a JIT tensor creation per tensor
         self.init_tensors()
         return self.sd[name]
  
@@ -310,7 +356,7 @@ class SafeTensorFile:
         
     def tensors(self) -> Dict[str, torch.tensor]:
         """Get dictionary of all tensors"""
-        self.init_tensors()
+        self.init_tensors(self.lazy_loading)
         return self.sd
         
     def metadata(self) -> Optional[Dict[str, str]]:
@@ -319,7 +365,7 @@ class SafeTensorFile:
         
     def __len__(self) -> int:
         """Get number of tensors"""
-        self.init_tensors()
+        self.init_tensors(self.lazy_loading)
         return len(self.keys())
         
     def __contains__(self, key: str) -> bool:
@@ -337,10 +383,9 @@ class SafeTensorFile:
 class _SafeTensorLoader:
     """Context manager for loading SafeTensorFile"""
     
-    def __init__(self, filename: str):
+    def __init__(self, filename: str ):
         self.filename = Path(filename)
         self.sft = None
-        
         if not self.filename.exists():
             raise FileNotFoundError(f"File not found: {filename}")
             
@@ -367,7 +412,6 @@ class _SafeTensorLoader:
 
 def safe_open(filename: str, framework: str = "pt",device = "cpu") -> _SafeTensorLoader:
     if device != "cpu" or framework !="pt":
-        pass
         return _old_safe_open(filename =filename, framework=framework, device=device)
     return _SafeTensorLoader(filename)
 

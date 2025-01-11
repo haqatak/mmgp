@@ -61,10 +61,22 @@ import sys
 import os
 import json
 import psutil
+try:    
+    from diffusers.utils.peft_utils import set_weights_and_activate_adapters, get_peft_kwargs
+except:
+    set_weights_and_activate_adapters = None
+    get_peft_kwargs = None
+    pass
+try:    
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+except:
+    inject_adapter_in_model = None
+    pass
+
 from mmgp import safetensors2
 from mmgp import profile_type
 
-from optimum.quanto import freeze, qfloat8, qint8, quantize, QModuleMixin, QTensor, WeightQBytesTensor, quantize_module 
+from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QTensor,  quantize_module 
 
 
 
@@ -127,6 +139,9 @@ def move_tensors(obj, device):
         return _list
     else:
         raise TypeError("Tensor or list / dict of tensors expected")
+def _get_module_name(v):
+    return v.__module__.lower()
+
 
 def _compute_verbose_level(level):
     if level <0:        
@@ -263,7 +278,13 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
     # print(f"num params to pin {model_id}: {len(params_list)}")
     for p in params_list:
         if isinstance(p, QTensor):
-            length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
+            if p._qtype == qint4:
+                if hasattr(p,"_scale_shift"):
+                    length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale_shift) * p._scale_shift.element_size() 
+                else:
+                    length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale) * p._scale.element_size() + torch.numel(p._shift) * p._shift.element_size()                     
+            else:
+                length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
         else:
             length = torch.numel(p.data) * p.data.element_size() 
 
@@ -306,10 +327,22 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
         if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
             current_big_tensor = big_tensors[big_tensor_no]
             if isinstance(p, QTensor):
-                length1 = torch.numel(p._data) * p._data.element_size() 
-                p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
-                length2 = torch.numel(p._scale) * p._scale.element_size() 
-                p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+                if p._qtype == qint4:
+                    length1 = torch.numel(p._data._data) * p._data._data.element_size()
+                    p._data._data =  _move_to_pinned_tensor(p._data._data, current_big_tensor, offset, length1)
+                    if hasattr(p,"_scale_shift"):
+                        length2 = torch.numel(p._scale_shift) * p._scale_shift.element_size() 
+                        p._scale_shift = _move_to_pinned_tensor(p._scale_shift, current_big_tensor, offset + length1, length2)
+                    else:
+                        length2 = torch.numel(p._scale) * p._scale.element_size() 
+                        p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+                        length3 = torch.numel(p._shift) * p._shift.element_size() 
+                        p._shift = _move_to_pinned_tensor(p._shift, current_big_tensor, offset + length1 + length2, length3)
+                else:
+                    length1 = torch.numel(p._data) * p._data.element_size() 
+                    p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
+                    length2 = torch.numel(p._scale) * p._scale.element_size() 
+                    p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
             else:
                 length = torch.numel(p.data) * p.data.element_size() 
                 p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
@@ -338,98 +371,6 @@ def _welcome():
     welcome_displayed = True
     print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
-
-# def _pin_to_memory_sd(model, sd, model_id, partialPinning = False, perc_reserved_mem_max = 0, verboseLevel = 1):
-#     if  verboseLevel>=1 :
-#         if partialPinning:
-#             print(f"Partial pinning to reserved RAM of data of file '{model_id}' while loading it")
-#         else:            
-#             print(f"Pinning data to reserved RAM of file '{model_id}' while loading it")
-
-#     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
-#     if partialPinning:
-#         towers_names, _ = _detect_main_towers(model)
-#         towers_names = [n +"." for n in towers_names]
-
-#     BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
-#     current_big_tensor_size = 0
-#     big_tensor_no  = 0
-#     big_tensors_sizes = []
-#     tensor_map_indexes = []
-#     total_tensor_bytes = 0
-
-#     for k,t in  sd.items():
-#         include = True
-#         # if isinstance(p, QTensor):
-#         #     length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
-#         # else:
-#         #     length = torch.numel(p.data) * p.data.element_size() 
-#         length = torch.numel(t) * t.data.element_size() 
-
-#         if partialPinning:
-#             include = any(k.startswith(pre) for pre in towers_names) if partialPinning else True
-
-#         if include:
-#             if current_big_tensor_size + length > BIG_TENSOR_MAX_SIZE:
-#                 big_tensors_sizes.append(current_big_tensor_size)
-#                 current_big_tensor_size = 0
-#                 big_tensor_no += 1
-#             tensor_map_indexes.append((big_tensor_no, current_big_tensor_size, length  ))
-#             current_big_tensor_size += length
-#         else:
-#             tensor_map_indexes.append((-1, 0, 0  ))
-#         total_tensor_bytes += length
-
-#     big_tensors_sizes.append(current_big_tensor_size)
-
-#     big_tensors = []
-#     last_big_tensor = 0
-#     total = 0
-    
-
-#     for size in big_tensors_sizes:
-#         try:
-#             currrent_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True)
-#             big_tensors.append(currrent_big_tensor)
-#         except:
-#             print(f"Unable to pin more tensors for this model as the maximum reservable memory has been reached ({total/ONE_MB:.2f})")
-#             break
-
-#         last_big_tensor += 1
-#         total += size
-
-
-#     tensor_no = 0
-#     for k,t in sd.items():
-#         big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
-#         if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
-#             current_big_tensor = big_tensors[big_tensor_no]
-#             # if isinstance(p, QTensor):
-#             #     length1 = torch.numel(p._data) * p._data.element_size() 
-#             #     p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
-#             #     length2 = torch.numel(p._scale) * p._scale.element_size() 
-#             #     p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
-#             # else:
-#             #     length = torch.numel(p.data) * p.data.element_size() 
-#             #     p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
-#             length = torch.numel(t) * t.data.element_size() 
-#             t = _move_to_pinned_tensor(t, current_big_tensor, offset, length)
-#             sd[k] = t
-#         tensor_no += 1
-
-#     global total_pinned_bytes
-#     total_pinned_bytes += total
-
-#     if verboseLevel >=1:
-#         if total_tensor_bytes == total:        
-#             print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
-#         else:
-#             print(f"{total/ONE_MB:.2f} MB were pinned to reserved RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
-
-#     model._already_pinned = True
-
-
-#     return 
 
 def  _quantize_dirty_hack(model):
     # dirty hack: add a hook on state_dict() to return a fake non quantized state_dict if called by Lora Diffusers initialization functions
@@ -536,10 +477,14 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
     prev_blocks_prefix = None
 
     if hasattr(model_to_quantize, "_quanto_map"):
+        for k, entry in model_to_quantize._quanto_map.items():
+            weights  =  entry["weights"]
+            print(f"Model '{model_id}' is already quantized to format '{weights}'")
+            return False
         print(f"Model '{model_id}' is already quantized")
         return False
-    
-    print(f"Quantization of model '{model_id}' started")
+
+    print(f"Quantization of model '{model_id}' started to format '{weights}'")
 
     for submodule_name, submodule in model_to_quantize.named_modules():  
         if isinstance(submodule, QModuleMixin):
@@ -594,18 +539,18 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
     if verboseLevel >=2:
         print(f"Total Excluded {total_excluded/ONE_MB:.1f} MB oF {total_size/ONE_MB:.1f} that is {perc_excluded*100:.2f}%")
     if perc_excluded >= 0.10:
-        print(f"Too many many modules are excluded, there is something wrong with the selection, switch back to full quantization.")
+        print(f"Too many modules are excluded, there is something wrong with the selection, switch back to full quantization.")
         exclude_list = None
 
 
     #quantize(model_to_quantize,weights, exclude= exclude_list)
-    pass
+
     for name, m in model_to_quantize.named_modules():
         if exclude_list is None or not any( name == module_name for module_name in exclude_list):
             _quantize_submodule(model_to_quantize, name, m, weights=weights, activations=None, optimizer=None)
 
-    # force read non quantized parameters so that their lazy tensors and corresponding mmap are released
-    # otherwise we may end up to keep in memory both the quantized and the non quantize model
+    # force to read non quantized parameters so that their lazy tensors and corresponding mmap are released
+    # otherwise we may end up keeping in memory both the quantized and the non quantize model
     for m in model_to_quantize.modules():
         # do not read quantized weights (detected them directly or behind an adapter)
         if isinstance(m, QModuleMixin) or hasattr(m, "base_layer") and  isinstance(m.base_layer, QModuleMixin): 
@@ -620,11 +565,15 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
             b.data = b.data + 0 
 
     
+
     freeze(model_to_quantize)
     torch.cuda.empty_cache()
     gc.collect()         
     quantization_map = _quantization_map(model_to_quantize)
     model_to_quantize._quanto_map = quantization_map
+
+    if hasattr(model_to_quantize, "_already_pinned"):
+        delattr(model_to_quantize, "_already_pinned")
 
     _quantize_dirty_hack(model_to_quantize)
 
@@ -684,15 +633,25 @@ class offload:
 
         for k,p in submodule.named_parameters(recurse=False):
             if isinstance(p, QTensor):
-                blocks_params.append( (submodule, k, p._data, p._scale) )
-                blocks_params_size += p._data.nbytes
-                blocks_params_size += p._scale.nbytes
+                blocks_params.append( (submodule, k, p ) )
+
+                if p._qtype == qint4:
+                    if hasattr(p,"_scale_shift"):
+                        blocks_params_size += torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
+                    else:
+                        blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
+                        blocks_params_size += torch.numel(p._shift) * p._shift.element_size()
+                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
+                else:
+                    blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
+                    blocks_params_size += torch.numel(p._data) * p._data.element_size()
             else:
-                blocks_params.append( (submodule, k, p.data, None) )
-                blocks_params_size += p.data.nbytes
+                blocks_params.append( (submodule, k, p  ) )
+                blocks_params_size += torch.numel(p.data) * p.data.element_size()
 
         for k, p in submodule.named_buffers(recurse=False):
-            blocks_params.append( (submodule, k, p.data, None) )
+            blocks_params.append( (submodule, k, p) )
             blocks_params_size += p.data.nbytes
 
 
@@ -710,34 +669,28 @@ class offload:
                 return False    
         return True
 
-    def gpu_load_blocks(self, model_id, blocks_name, async_load = False):
+
+    def gpu_load_blocks(self, model_id, blocks_name):
         # cl = clock.start()
 
         if blocks_name != None:
             self.loaded_blocks[model_id] = blocks_name           
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
-
-        def cpu_to_gpu(stream_to_use, blocks_params, record_for_stream = None):
+        
+        def cpu_to_gpu(stream_to_use, blocks_params): #, record_for_stream = None
             with torch.cuda.stream(stream_to_use):
                 for param in blocks_params:
-                    parent_module, n, data, scale  = param
-                    p = getattr(parent_module, n)
-                    if isinstance(p, QTensor):
-                        q = WeightQBytesTensor.create(p.qtype, p.axis, p.size(), p.stride(), data.cuda(non_blocking=True), scale.cuda(non_blocking=True), activation_qtype=p.activation_qtype, requires_grad=p.requires_grad )
-                        #q = p.to("cuda", non_blocking=True)
-                        q = torch.nn.Parameter(q , requires_grad=False)
-                        setattr(parent_module, n , q)
-                        del p
-                    else:
-                        p.data = p.data.cuda(non_blocking=True) 
-                    
-                    if record_for_stream != None:
-                        if isinstance(p, QTensor):
-                            q._data.record_stream(record_for_stream)
-                            q._scale.record_stream(record_for_stream)
-                        else:
-                            p.data.record_stream(record_for_stream)
+                    parent_module, n, p  = param
+                    q = p.to("cuda", non_blocking=True)
+                    q = torch.nn.Parameter(q , requires_grad=False)
+                    setattr(parent_module, n , q)
+                    # if record_for_stream != None:
+                    #     if isinstance(p, QTensor):
+                    #         q._data.record_stream(record_for_stream)
+                    #         q._scale.record_stream(record_for_stream)
+                    #     else:
+                    #         p.data.record_stream(record_for_stream)
 
 
         if self.verboseLevel >=2:
@@ -776,19 +729,10 @@ class offload:
             print(f"Unloading model {blocks_name} ({model_name}) from GPU")
  
         blocks_params = self.blocks_of_modules[blocks_name]
-
         for param in blocks_params:
-            parent_module, n, data, scale = param
-            p = getattr(parent_module, n) 
-            if isinstance(p, QTensor):
-                # need to change the parameter directly from the module as it can't be swapped in place due to a memory leak in the pytorch compiler
-                q = WeightQBytesTensor.create(p.qtype, p.axis, p.size(), p.stride(), data, scale, activation_qtype=p.activation_qtype, requires_grad=p.requires_grad )
-                q = torch.nn.Parameter(q , requires_grad=False)
-                setattr(parent_module, n , q)
-                del p
-            else:
-                p.data = data
-
+            parent_module, n, p  = param
+            q = torch.nn.Parameter(p , requires_grad=False)
+            setattr(parent_module, n , q)
         # cl.stop()
         # print(f"unload time: {cl.format_time_gap()}")
 
@@ -824,8 +768,8 @@ class offload:
             if torch.is_tensor(arg):    
                 if arg.dtype == torch.float32:
                     arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
-                else:
-                    arg = arg.cuda(non_blocking=True)             
+                elif not arg.is_cuda:
+                    arg = arg.cuda(non_blocking=True)
             new_args.append(arg)
 
         for k in kwargs:
@@ -833,7 +777,7 @@ class offload:
             if torch.is_tensor(arg):
                 if arg.dtype == torch.float32:
                     arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
-                else:
+                elif not arg.is_cuda:
                     arg = arg.cuda(non_blocking=True)             
             new_kwargs[k]= arg
         
@@ -897,6 +841,10 @@ class offload:
 
     def hook_check_empty_cache_needed(self, target_module, model_id,blocks_name, previous_method,  context):
 
+        qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
+        if qint4quantization:
+            pass
+
         def check_empty_cuda_cache(module, *args, **kwargs):
             # if self.ready_to_check_mem():
             #     self.empty_cache_if_needed()
@@ -912,6 +860,8 @@ class offload:
                             self.empty_cache_if_needed()
                     self.loaded_blocks[model_id] = blocks_name
                     self.gpu_load_blocks(model_id, blocks_name)
+            if qint4quantization:
+                args, kwargs = self.move_args_to_gpu(*args, **kwargs)
 
             return previous_method(*args, **kwargs) 
 
@@ -970,7 +920,105 @@ class offload:
     #     for module in parent_module.components.items():
     #         self.unhook_module(module)
 
-def fast_load_transformers_model(model_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False,  verboseLevel = -1):
+import torch
+
+
+
+
+def load_loras_into_model(model, lora_path, lora_multi = None, verboseLevel = -1):
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    if inject_adapter_in_model == None or set_weights_and_activate_adapters == None or  get_peft_kwargs == None:
+        raise Exception("Unable to load Lora, missing 'peft' and / or 'diffusers' modules")
+    
+    if not isinstance(lora_path, list):
+        lora_path = [lora_path]
+    
+    if lora_multi is None:
+        lora_multi = [1. for _ in lora_path]
+
+    for i, path in enumerate(lora_path):
+        adapter_name = str(i)
+
+        state_dict = safetensors2.torch_load_file(path)
+        
+        keys = list(state_dict.keys())
+        if len(keys) == 0:
+            raise Exception(f"Empty Lora '{path}'")
+
+
+        network_alphas = {}
+        for k in keys:
+            if "alpha" in k:
+                alpha_value = state_dict.pop(k)
+                if not ( (torch.is_tensor(alpha_value) and torch.is_floating_point(alpha_value)) or isinstance(
+                    alpha_value, float
+                )):
+                    network_alphas[k] =  torch.tensor( float(alpha_value.item() ) )
+
+        pos = keys[0].find(".")
+        prefix = keys[0][0:pos]
+        if not any( prefix.startswith(some_prefix) for some_prefix in ["diffusion_model", "transformer"]): 
+            msg = f"No compatible weight was found in Lora file '{path}'. Please check that it is compatible with the Diffusers format."
+            raise Exception(msg)
+
+        transformer = model
+
+        transformer_keys = [k for k in keys if k.startswith(prefix)]
+        state_dict = {
+            k.replace(f"{prefix}.", ""): v for k, v in state_dict.items() if k in transformer_keys
+        }
+
+        sd_keys = state_dict.keys()
+        if len(sd_keys) == 0:
+            print(f"No compatible weight was found in Lora file '{path}'. Please check that it is compatible with the Diffusers format.")
+            return
+
+        # is_correct_format = all("lora" in key for key in state_dict.keys())
+
+
+
+
+        # check with first key if is not in peft format
+        # first_key = next(iter(state_dict.keys()))
+        # if "lora_A" not in first_key:
+        #     state_dict = convert_unet_state_dict_to_peft(state_dict)
+
+        if adapter_name in getattr(transformer, "peft_config", {}):
+            raise ValueError(
+                f"Adapter name {adapter_name} already in use in the transformer - please select a new adapter name."
+            )
+
+        rank = {}
+        for key, val in state_dict.items():
+            if "lora_B" in key:
+                rank[key] = val.shape[1]
+
+        if network_alphas is not None and len(network_alphas) >= 1:
+            alpha_keys = [k for k in network_alphas.keys() if k.startswith(prefix) and k.split(".")[0] == prefix]
+            network_alphas = {k.replace(f"{prefix}.", ""): v for k, v in network_alphas.items() if k in alpha_keys}
+
+        lora_config_kwargs = get_peft_kwargs(rank, network_alpha_dict=network_alphas, peft_state_dict=state_dict)
+        
+        lora_config = LoraConfig(**lora_config_kwargs)
+        peft_kwargs = {}        
+        peft_kwargs["low_cpu_mem_usage"] = True
+        inject_adapter_in_model(lora_config, model, adapter_name=adapter_name, **peft_kwargs)
+
+        incompatible_keys = set_peft_model_state_dict(transformer, state_dict, adapter_name, **peft_kwargs)
+
+        warn_msg = ""
+        if incompatible_keys is not None:
+            # Check only for unexpected keys.
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                pass
+        if verboseLevel >=1:
+            print(f"Lora '{path}' was loaded in model '{_get_module_name(model)}'")
+    set_weights_and_activate_adapters(model,[ str(i) for i in range(len(lora_multi))], lora_multi)
+
+
+def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, verboseLevel = -1):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1040,13 +1088,13 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantization_type = quantization_type, pinToMemory= pinToMemory, partialPinning= partialPinning, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path: str, do_quantize = False, quantization_type = qint8, pinToMemory = False, partialPinning = False, verboseLevel = -1):
+def load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -1067,14 +1115,6 @@ def load_model_data(model, file_path: str, do_quantize = False, quantization_typ
             state_dict = state_dict["module"]
     else:
         state_dict, metadata = _safetensors_load_file(file_path)
-
-
-        # if pinToMemory:
-        #     _pin_to_memory_sd(model,state_dict, file_path, partialPinning = partialPinning, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel = verboseLevel)
-
-        # with safetensors2.safe_open(file_path) as f:
-        #     metadata = f.metadata() 
-
             
         if metadata is None:
             quantization_map = None
@@ -1109,7 +1149,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantization_typ
 
     if do_quantize:
         if quantization_map is None:
-            if _quantize(model, quantization_type, verboseLevel=verboseLevel, model_id=file_path):
+            if _quantize(model, quantizationType, verboseLevel=verboseLevel, model_id=file_path):
                 quantization_map = model._quanto_map  
         else:
             if verboseLevel >=1:
@@ -1120,7 +1160,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantization_typ
 
     return
 
-def save_model(model, file_path, do_quantize = False, quantization_type = qint8, verboseLevel = -1 ):
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1 ):
     """save the weights of a model and quantize them if requested
     These weights can be loaded again using 'load_model_data'
     """       
@@ -1147,7 +1187,7 @@ def save_model(model, file_path, do_quantize = False, quantization_type = qint8,
                 config= json.loads(text)
 
     if do_quantize:
-        _quantize(model, weights=quantization_type, model_id=file_path)
+        _quantize(model, weights=quantizationType, model_id=file_path)
     
     quantization_map = getattr(model, "_quanto_map", None)
 
@@ -1160,7 +1200,7 @@ def save_model(model, file_path, do_quantize = False, quantization_type = qint8,
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = -1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -1238,6 +1278,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
     if self.anyCompiledModule:
         torch._dynamo.config.cache_size_limit = 10000
+        torch.compiler.reset()
+
       #  torch._logging.set_logs(recompiles=True)
       #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
 
@@ -1252,19 +1294,31 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
         
         # if the model has just been quantized so there is no need to quantize it again
         if model_id in models_to_quantize:
-            _quantize(current_model, weights=qint8, verboseLevel = self.verboseLevel, model_id=model_id)
+            _quantize(current_model, weights=quantizationType, verboseLevel = self.verboseLevel, model_id=model_id)
 
         modelPinned = (pinAllModels or model_id in modelsToPin) and not hasattr(current_model,"_already_pinned")
 
-        current_model_size = 0    
-        # load all the remaining unread lazy safetensors in RAM to free open cache files 
-        for p in current_model.parameters():
+        current_model_size = 0
+
+        for n, p in current_model.named_parameters():
+            p.requires_grad = False
+            p = p.detach()
             if isinstance(p, QTensor):
                 # # fix quanto bug (seems to have been fixed)   
                 # if not modelPinned and p._scale.dtype == torch.float32:
                 #     p._scale = p._scale.to(torch.bfloat16) 
-                current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
-                current_model_size +=  torch.numel(p._data) * p._data.element_size()
+                if p._qtype == qint4:
+                    if hasattr(p,"_scale_shift"):
+                        current_model_size +=  torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                    else:
+                        current_model_size +=  torch.numel(p._scale) * p._shift.element_size() + torch.numel(p._scale) * p._shift.element_size()
+
+                    current_model_size +=  torch.numel(p._data._data) * p._data._data.element_size()
+
+                else:
+                    current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
+                    current_model_size +=  torch.numel(p._data) * p._data.element_size()
+
             else:
                 if p.data.dtype == torch.float32:
                     # convert any left overs float32 weight to bloat16 to divide by 2 the model memory footprint
@@ -1272,7 +1326,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                 current_model_size +=  torch.numel(p.data) * p.data.element_size()
                             
         for b in current_model.buffers():
-            if b.data.dtype == torch.float32:
+            if b.data.dtype == torch.float32: 
                 # convert any left overs float32 weight to bloat16 to divide by 2 the model memory footprint
                 b.data = b.data.to(torch.bfloat16)
             current_model_size +=  torch.numel(b.data) * b.data.element_size()
@@ -1308,7 +1362,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
             print(f"Potential iterative blocks found in model '{model_id}':{towers_names}")
         # compile main iterative modules stacks ("towers")
         if compileAllModels or model_id in modelsToCompile :
-            #torch.compiler.reset()
             if self.verboseLevel>=1:
                 print(f"Pytorch compilation of model '{model_id}' is scheduled.")
             for tower in towers_modules:
@@ -1406,7 +1459,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         modules= modules.components 
 
     modules = {k: _remove_model_wrapper(v) for k, v in modules.items() if isinstance(v, torch.nn.Module)}
-    module_names = {k: v.__module__.lower() for k, v in modules.items() }
+    module_names = {k: _get_module_name(v) for k, v in modules.items() }
 
     default_extraModelsToQuantize = []
     quantizeTransformer = True

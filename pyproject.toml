@@ -1,6 +1,6 @@
 [project]
 name = "mmgp"
-version = "3.0.3"
+version = "3.0.9"
 authors = [
   { name = "deepbeepmeep", email = "deepbeepmeep@yahoo.com" },
 ]
@@ -14,5 +14,6 @@ dependencies = [
   "accelerate",
   "safetensors",
   "psutil"
+  "peft"
 ]
 
