@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -79,7 +79,7 @@ from mmgp import profile_type
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QTensor,  quantize_module 
 
 
-
+shared_state = {}
 
 mmm = safetensors2.mmm
 
@@ -154,33 +154,75 @@ def _get_max_reservable_memory(perc_reserved_mem_max):
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
     return  perc_reserved_mem_max * physical_memory
 
-def _detect_main_towers(model, verboseLevel=1):
+def _detect_main_towers(model, min_floors = 5, verboseLevel=1):
     cur_blocks_prefix = None
     towers_modules= []
     towers_names= []
 
+    floors_modules= []
+    tower_name = None
+
+
     for submodule_name, submodule in model.named_modules():  
+
         if submodule_name=='':
             continue
 
-        if isinstance(submodule, torch.nn.ModuleList):
-            newList =False
-            if cur_blocks_prefix == None:
-                cur_blocks_prefix = submodule_name + "."
-                newList = True
-            else:
-                if not submodule_name.startswith(cur_blocks_prefix):
-                    cur_blocks_prefix = submodule_name + "."
-                    newList = True
+        if cur_blocks_prefix != None:
+            if submodule_name.startswith(cur_blocks_prefix):
+                depth_prefix = cur_blocks_prefix.split(".")
+                depth_name = submodule_name.split(".")
+                level  =  depth_name[len(depth_prefix)-1]                        
+                pre , num = _extract_num_from_str(level)
 
-            if newList and len(submodule)>=5:
-                towers_names.append(submodule_name)
-                towers_modules.append(submodule)
+                if num != cur_blocks_seq: 
+                    floors_modules.append(submodule)
+
+                cur_blocks_seq = num
+            else:
+                if len(floors_modules) >= min_floors:
+                    towers_modules += floors_modules
+                    towers_names.append(tower_name)
+                tower_name = None
+                floors_modules= []
+                cur_blocks_prefix, cur_blocks_seq = None, -1
+
+        if cur_blocks_prefix == None:
+            pre , num = _extract_num_from_str(submodule_name)
+            if isinstance(submodule, (torch.nn.ModuleList)):  
+                cur_blocks_prefix, cur_blocks_seq = pre + ".",  -1
+                tower_name = submodule_name + ".*" 
+            elif num >=0:
+                cur_blocks_prefix, cur_blocks_seq = pre, num
+                tower_name = submodule_name[ :-1] + "*" 
+                floors_modules.append(submodule)
+
+    if len(floors_modules) >= min_floors:
+        towers_modules += floors_modules
+        towers_names.append(tower_name)
+
+    # for submodule_name, submodule in model.named_modules():  
+    #     if submodule_name=='':
+    #         continue
+
+    #     if isinstance(submodule, torch.nn.ModuleList):
+    #         newList =False
+    #         if cur_blocks_prefix == None:
+    #             cur_blocks_prefix = submodule_name + "."
+    #             newList = True
+    #         else:
+    #             if not submodule_name.startswith(cur_blocks_prefix):
+    #                 cur_blocks_prefix = submodule_name + "."
+    #                 newList = True
+
+    #         if newList and len(submodule)>=5:
+    #             towers_names.append(submodule_name)
+    #             towers_modules.append(submodule)
                 
-        else:                
-            if cur_blocks_prefix is not None:
-                if not submodule_name.startswith(cur_blocks_prefix):
-                    cur_blocks_prefix = None 
+    #     else:                
+    #         if cur_blocks_prefix is not None:
+    #             if not submodule_name.startswith(cur_blocks_prefix):
+    #                 cur_blocks_prefix = None 
 
     return towers_names, towers_modules
 
@@ -194,7 +236,7 @@ def _get_model(model_path):
     _path = Path(model_path).parts
     _filename = _path[-1]
     _path = _path[:-1]
-    if len(_path)==1:
+    if len(_path)<=1:
         raise("file not found")
     else:
         from huggingface_hub import  hf_hub_download #snapshot_download,    
@@ -369,8 +411,16 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
+def _extract_num_from_str(num_in_str):
+    for i in range(len(num_in_str)):
+        if not num_in_str[-i-1:].isnumeric():
+            if i == 0:
+                return num_in_str, -1
+            else:             
+                return num_in_str[: -i],  int(num_in_str[-i:])                    
+    return  "", int(num_in_str)
 
 def  _quantize_dirty_hack(model):
     # dirty hack: add a hook on state_dict() to return a fake non quantized state_dict if called by Lora Diffusers initialization functions
@@ -581,350 +631,6 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
 
     return True
 
-def get_model_name(model):
-    return model.name
-
-class HfHook:
-    def __init__(self):
-        self.execution_device = "cuda"
-
-    def detach_hook(self, module):
-        pass
-
-last_offload_obj = None
-class offload:
-    def __init__(self):
-        self.active_models = []
-        self.active_models_ids = []
-        self.active_subcaches = {}        
-        self.models = {}
-        self.verboseLevel = 0
-        self.blocks_of_modules = {}
-        self.blocks_of_modules_sizes = {}
-        self.anyCompiledModule = False
-        self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
-        self.last_reserved_mem_check =0
-        self.loaded_blocks = {}
-        self.prev_blocks_names = {}
-        self.next_blocks_names = {}
-        self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
-        self.transfer_stream = torch.cuda.Stream()
-        self.async_transfers = False
-        global last_offload_obj
-        last_offload_obj = self
-        
-    def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name):
-
-        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
-        if entry_name in self.blocks_of_modules:
-            blocks_params = self.blocks_of_modules[entry_name]
-            blocks_params_size = self.blocks_of_modules_sizes[entry_name]
-        else:
-            blocks_params = []
-            self.blocks_of_modules[entry_name] = blocks_params
-            blocks_params_size = 0
-            if blocks_name !=None:
-
-                prev_entry_name = None if prev_block_name == None else  model_id + "/" + prev_block_name
-                self.prev_blocks_names[entry_name] =  prev_entry_name
-                if not prev_block_name == None:
-                    self.next_blocks_names[prev_entry_name] = entry_name        
-
-
-        for k,p in submodule.named_parameters(recurse=False):
-            if isinstance(p, QTensor):
-                blocks_params.append( (submodule, k, p ) )
-
-                if p._qtype == qint4:
-                    if hasattr(p,"_scale_shift"):
-                        blocks_params_size += torch.numel(p._scale_shift) * p._scale_shift.element_size()
-                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
-                    else:
-                        blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
-                        blocks_params_size += torch.numel(p._shift) * p._shift.element_size()
-                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
-                else:
-                    blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
-                    blocks_params_size += torch.numel(p._data) * p._data.element_size()
-            else:
-                blocks_params.append( (submodule, k, p  ) )
-                blocks_params_size += torch.numel(p.data) * p.data.element_size()
-
-        for k, p in submodule.named_buffers(recurse=False):
-            blocks_params.append( (submodule, k, p) )
-            blocks_params_size += p.data.nbytes
-
-
-        self.blocks_of_modules_sizes[entry_name] = blocks_params_size
-
-        return blocks_params_size
-
-
-    def can_model_be_cotenant(self, model_id):
-        potential_cotenants= cotenants_map.get(model_id, None)
-        if potential_cotenants is None: 
-            return False
-        for existing_cotenant in self.active_models_ids:
-            if existing_cotenant not in potential_cotenants: 
-                return False    
-        return True
-
-
-    def gpu_load_blocks(self, model_id, blocks_name):
-        # cl = clock.start()
-
-        if blocks_name != None:
-            self.loaded_blocks[model_id] = blocks_name           
-
-        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
-        
-        def cpu_to_gpu(stream_to_use, blocks_params): #, record_for_stream = None
-            with torch.cuda.stream(stream_to_use):
-                for param in blocks_params:
-                    parent_module, n, p  = param
-                    q = p.to("cuda", non_blocking=True)
-                    q = torch.nn.Parameter(q , requires_grad=False)
-                    setattr(parent_module, n , q)
-                    # if record_for_stream != None:
-                    #     if isinstance(p, QTensor):
-                    #         q._data.record_stream(record_for_stream)
-                    #         q._scale.record_stream(record_for_stream)
-                    #     else:
-                    #         p.data.record_stream(record_for_stream)
-
-
-        if self.verboseLevel >=2:
-            model = self.models[model_id]
-            model_name = model._get_name()
-            print(f"Loading model {entry_name} ({model_name}) in GPU")
- 
-
-        if self.async_transfers and blocks_name != None:
-            first = self.prev_blocks_names[entry_name] == None
-            next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
-            if first:
-                cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
-            torch.cuda.synchronize()
-
-            if next_blocks_entry != None:
-                cpu_to_gpu(self.transfer_stream, self.blocks_of_modules[next_blocks_entry]) #, self.default_stream
-
-        else:
-            cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
-            torch.cuda.synchronize()
-        # cl.stop()
-        # print(f"load time: {cl.format_time_gap()}")
-
-
-    def gpu_unload_blocks(self, model_id, blocks_name):
-        # cl = clock.start()
-        if blocks_name != None:
-            self.loaded_blocks[model_id] = None 
-
-        blocks_name = model_id if blocks_name is None else model_id + "/" + blocks_name
-
-        if self.verboseLevel >=2:
-            model = self.models[model_id]
-            model_name = model._get_name()
-            print(f"Unloading model {blocks_name} ({model_name}) from GPU")
- 
-        blocks_params = self.blocks_of_modules[blocks_name]
-        for param in blocks_params:
-            parent_module, n, p  = param
-            q = torch.nn.Parameter(p , requires_grad=False)
-            setattr(parent_module, n , q)
-        # cl.stop()
-        # print(f"unload time: {cl.format_time_gap()}")
-
-
-    def gpu_load(self, model_id):
-        model = self.models[model_id]
-        self.active_models.append(model)
-        self.active_models_ids.append(model_id)
-
-        self.gpu_load_blocks(model_id, None)
-
-        # torch.cuda.current_stream().synchronize()    
-
-    def unload_all(self):
-        for model_id in self.active_models_ids:
-            self.gpu_unload_blocks(model_id, None)      
-            loaded_block = self.loaded_blocks[model_id]
-            if loaded_block != None:
-                self.gpu_unload_blocks(model_id, loaded_block)      
-                self.loaded_blocks[model_id] = None  
- 
-        self.active_models = []
-        self.active_models_ids = []
-        self.active_subcaches = []
-        torch.cuda.empty_cache()
-        gc.collect()
-        self.last_reserved_mem_check = time.time()
-
-    def move_args_to_gpu(self, *args, **kwargs):
-        new_args= []
-        new_kwargs={}
-        for arg in args:
-            if torch.is_tensor(arg):    
-                if arg.dtype == torch.float32:
-                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
-                elif not arg.is_cuda:
-                    arg = arg.cuda(non_blocking=True)
-            new_args.append(arg)
-
-        for k in kwargs:
-            arg = kwargs[k]
-            if torch.is_tensor(arg):
-                if arg.dtype == torch.float32:
-                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
-                elif not arg.is_cuda:
-                    arg = arg.cuda(non_blocking=True)             
-            new_kwargs[k]= arg
-        
-        return new_args, new_kwargs
-
-    def ready_to_check_mem(self):
-        if self.anyCompiledModule:
-             return
-        cur_clock = time.time()
-        # can't check at each call if we can empty the cuda cache as quering the reserved memory value is a time consuming operation
-        if (cur_clock - self.last_reserved_mem_check)<0.200:
-            return False
-        self.last_reserved_mem_check = cur_clock
-        return True        
-
-
-    def empty_cache_if_needed(self):
-        mem_reserved = torch.cuda.memory_reserved()
-        mem_threshold = 0.9*self.device_mem_capacity
-        if mem_reserved >= mem_threshold:            
-            mem_allocated = torch.cuda.memory_allocated()
-            if mem_allocated <= 0.70 * mem_reserved: 
-                # print(f"Cuda empty cache triggered as Allocated Memory ({mem_allocated/1024000:0f} MB) is lot less than Cached Memory ({mem_reserved/1024000:0f} MB)  ")
-                torch.cuda.empty_cache()
-                tm= time.time()
-                if self.verboseLevel >=2:
-                    print(f"Empty Cuda cache at {tm}")
-                # print(f"New cached memory after purge is {torch.cuda.memory_reserved()/1024000:0f} MB)  ")
-
-
-    def any_param_or_buffer(self, target_module: torch.nn.Module):
-        
-        for _ in target_module.parameters(recurse= False):
-            return True
-        
-        for _ in target_module.buffers(recurse= False):
-            return True
-        
-        return False
-
-    def hook_load_data_if_needed(self, target_module, model_id,blocks_name, context):
-
-        @torch.compiler.disable()
-        def load_data_if_needed(module,  *args, **kwargs):
-            some_context = context #for debugging
-            if blocks_name == None:
-                if self.ready_to_check_mem():
-                    self.empty_cache_if_needed()
-            else:                
-                loaded_block = self.loaded_blocks[model_id]
-                if (loaded_block == None or loaded_block != blocks_name) :
-                    if loaded_block != None:
-                        self.gpu_unload_blocks(model_id, loaded_block)
-                        if self.ready_to_check_mem():
-                            self.empty_cache_if_needed()
-                    self.loaded_blocks[model_id] = blocks_name
-                    self.gpu_load_blocks(model_id, blocks_name)
-
-        target_module.register_forward_pre_hook(load_data_if_needed)        
-
-
-    def hook_check_empty_cache_needed(self, target_module, model_id,blocks_name, previous_method,  context):
-
-        qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
-        if qint4quantization:
-            pass
-
-        def check_empty_cuda_cache(module, *args, **kwargs):
-            # if self.ready_to_check_mem():
-            #     self.empty_cache_if_needed()
-            if blocks_name == None:
-                if self.ready_to_check_mem():
-                    self.empty_cache_if_needed()
-            else:                
-                loaded_block = self.loaded_blocks[model_id]
-                if (loaded_block == None or loaded_block != blocks_name) :
-                    if loaded_block != None:
-                        self.gpu_unload_blocks(model_id, loaded_block)
-                        if self.ready_to_check_mem():
-                            self.empty_cache_if_needed()
-                    self.loaded_blocks[model_id] = blocks_name
-                    self.gpu_load_blocks(model_id, blocks_name)
-            if qint4quantization:
-                args, kwargs = self.move_args_to_gpu(*args, **kwargs)
-
-            return previous_method(*args, **kwargs) 
-
-
-        if hasattr(target_module, "_mm_id"):
-            orig_model_id = getattr(target_module, "_mm_id")
-            if self.verboseLevel >=2:
-                print(f"Model '{model_id}' shares module '{target_module._get_name()}' with module '{orig_model_id}' ")
-            assert not self.any_param_or_buffer(target_module)
-
-            return
-        setattr(target_module, "_mm_id", model_id)
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
-
-        
-    def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
-        def check_change_module(module, *args, **kwargs):
-            performEmptyCacheTest = False
-            if not model_id in self.active_models_ids:
-                new_model_id = getattr(module, "_mm_id") 
-                # do not always unload existing models if it is more efficient to keep in them in the GPU 
-                # (e.g: small modules whose calls are text encoders) 
-                if not self.can_model_be_cotenant(new_model_id) :
-                    self.unload_all()
-                    performEmptyCacheTest = False
-                self.gpu_load(new_model_id)
-            # transfer leftovers inputs that were incorrectly created in the RAM (mostly due to some .device tests that returned incorrectly "cpu")
-            args, kwargs = self.move_args_to_gpu(*args, **kwargs)
-            if performEmptyCacheTest:
-                self.empty_cache_if_needed()
-     
-            return previous_method(*args, **kwargs) 
-  
-        if hasattr(target_module, "_mm_id"):
-            return
-        setattr(target_module, "_mm_id", model_id)
-
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
-
-        if not self.verboseLevel >=1:
-            return
-
-        if module_id == None or module_id =='':
-            model_name = model._get_name()
-            print(f"Hooked in model '{model_id}' ({model_name})")
-
-
-    # Not implemented yet, but why would one want to get rid of these features ?
-    # def unhook_module(module: torch.nn.Module):
-    #     if not hasattr(module,"_mm_id"):
-    #         return
-        
-    #     delattr(module, "_mm_id")
-                 
-    # def unhook_all(parent_module: torch.nn.Module):
-    #     for module in parent_module.components.items():
-    #         self.unhook_module(module)
-
-import torch
-
-
-
-
 def load_loras_into_model(model, lora_path, lora_multi = None, verboseLevel = -1):
     verboseLevel = _compute_verbose_level(verboseLevel)
 
@@ -1058,6 +764,8 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         class_name = architectures[0] 
 
         module = __import__("transformers")
+        map = {  "T5WithLMHeadModel" : "T5EncoderModel"}
+        class_name = map.get(class_name, class_name)
         transfomer_class = getattr(module, class_name)
         from transformers import AutoConfig
 
@@ -1144,8 +852,20 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
         else:
             _requantize(model, state_dict, quantization_map)    
 
-    missing_keys , unexpected_keys = model.load_state_dict(state_dict, strict = quantization_map is None,  assign = True )
+    missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
+    # if len(missing_keys) > 0:
+    #     sd_crap = { k : None for k in missing_keys}
+    #     missing_keys , unexpected_keys = model.load_state_dict(sd_crap, strict =False,  assign = True )
     del state_dict
+
+    for k,p in model.named_parameters():
+        if p.is_meta:
+            txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since parameter '{k}' has no data"
+            raise Exception(txt)
+    for k,b in model.named_buffers():
+        if b.is_meta:
+            txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since buffer '{k}' has no data"
+            raise Exception(txt)
 
     if do_quantize:
         if quantization_map is None:
@@ -1160,16 +880,348 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
 
     return
 
-def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1 ):
+def get_model_name(model):
+    return model.name
+
+class HfHook:
+    def __init__(self):
+        self.execution_device = "cuda"
+
+    def detach_hook(self, module):
+        pass
+
+last_offload_obj = None
+class offload:
+    def __init__(self):
+        self.active_models = []
+        self.active_models_ids = []
+        self.active_subcaches = {}        
+        self.models = {}
+        self.verboseLevel = 0
+        self.blocks_of_modules = {}
+        self.blocks_of_modules_sizes = {}
+        self.anyCompiledModule = False
+        self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
+        self.last_reserved_mem_check =0
+        self.loaded_blocks = {}
+        self.prev_blocks_names = {}
+        self.next_blocks_names = {}
+        self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
+        self.transfer_stream = torch.cuda.Stream()
+        self.async_transfers = False
+        global last_offload_obj
+        last_offload_obj = self
+
+        
+    def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name):
+
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        if entry_name in self.blocks_of_modules:
+            blocks_params = self.blocks_of_modules[entry_name]
+            blocks_params_size = self.blocks_of_modules_sizes[entry_name]
+        else:
+            blocks_params = []
+            self.blocks_of_modules[entry_name] = blocks_params
+            blocks_params_size = 0
+            if blocks_name !=None:
+
+                prev_entry_name = None if prev_block_name == None else  model_id + "/" + prev_block_name
+                self.prev_blocks_names[entry_name] =  prev_entry_name
+                if not prev_block_name == None:
+                    self.next_blocks_names[prev_entry_name] = entry_name        
+
+
+        for k,p in submodule.named_parameters(recurse=False):
+            if isinstance(p, QTensor):
+                blocks_params.append( (submodule, k, p ) )
+
+                if p._qtype == qint4:
+                    if hasattr(p,"_scale_shift"):
+                        blocks_params_size += torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
+                    else:
+                        blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
+                        blocks_params_size += torch.numel(p._shift) * p._shift.element_size()
+                        blocks_params_size += torch.numel(p._data._data) * p._data._data.element_size()
+                else:
+                    blocks_params_size += torch.numel(p._scale) * p._scale.element_size()
+                    blocks_params_size += torch.numel(p._data) * p._data.element_size()
+            else:
+                blocks_params.append( (submodule, k, p  ) )
+                blocks_params_size += torch.numel(p.data) * p.data.element_size()
+
+        for k, p in submodule.named_buffers(recurse=False):
+            blocks_params.append( (submodule, k, p) )
+            blocks_params_size += p.data.nbytes
+
+
+        self.blocks_of_modules_sizes[entry_name] = blocks_params_size
+
+        return blocks_params_size
+
+
+    def can_model_be_cotenant(self, model_id):
+        potential_cotenants= cotenants_map.get(model_id, None)
+        if potential_cotenants is None: 
+            return False
+        for existing_cotenant in self.active_models_ids:
+            if existing_cotenant not in potential_cotenants: 
+                return False    
+        return True
+
+    @torch.compiler.disable()
+    def gpu_load_blocks(self, model_id, blocks_name):
+        # cl = clock.start()
+
+        if blocks_name != None:
+            self.loaded_blocks[model_id] = blocks_name           
+
+        entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+        
+        def cpu_to_gpu(stream_to_use, blocks_params): #, record_for_stream = None
+            with torch.cuda.stream(stream_to_use):
+                for param in blocks_params:
+                    parent_module, n, p  = param
+                    q = p.to("cuda", non_blocking=True)
+                    q = torch.nn.Parameter(q , requires_grad=False)
+                    setattr(parent_module, n , q)
+                    # if record_for_stream != None:
+                    #     if isinstance(p, QTensor):
+                    #         q._data.record_stream(record_for_stream)
+                    #         q._scale.record_stream(record_for_stream)
+                    #     else:
+                    #         p.data.record_stream(record_for_stream)
+
+
+        if self.verboseLevel >=2:
+            model = self.models[model_id]
+            model_name = model._get_name()
+            print(f"Loading model {entry_name} ({model_name}) in GPU")
+ 
+
+        if self.async_transfers and blocks_name != None:
+            first = self.prev_blocks_names[entry_name] == None
+            next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
+            if first:
+                cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
+            torch.cuda.synchronize()
+
+            if next_blocks_entry != None:
+                cpu_to_gpu(self.transfer_stream, self.blocks_of_modules[next_blocks_entry]) #, self.default_stream
+
+        else:
+            cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
+            torch.cuda.synchronize()
+        # cl.stop()
+        # print(f"load time: {cl.format_time_gap()}")
+
+    @torch.compiler.disable()
+    def gpu_unload_blocks(self, model_id, blocks_name):
+        # cl = clock.start()
+        if blocks_name != None:
+            self.loaded_blocks[model_id] = None 
+
+        blocks_name = model_id if blocks_name is None else model_id + "/" + blocks_name
+
+        if self.verboseLevel >=2:
+            model = self.models[model_id]
+            model_name = model._get_name()
+            print(f"Unloading model {blocks_name} ({model_name}) from GPU")
+ 
+        blocks_params = self.blocks_of_modules[blocks_name]
+        for param in blocks_params:
+            parent_module, n, p  = param
+            q = torch.nn.Parameter(p , requires_grad=False)
+            setattr(parent_module, n , q)
+        # cl.stop()
+        # print(f"unload time: {cl.format_time_gap()}")
+
+    # @torch.compiler.disable()
+    def gpu_load(self, model_id):
+        model = self.models[model_id]
+        self.active_models.append(model)
+        self.active_models_ids.append(model_id)
+
+        self.gpu_load_blocks(model_id, None)
+
+        # torch.cuda.current_stream().synchronize()    
+
+    def unload_all(self):
+        for model_id in self.active_models_ids:
+            self.gpu_unload_blocks(model_id, None)      
+            loaded_block = self.loaded_blocks[model_id]
+            if loaded_block != None:
+                self.gpu_unload_blocks(model_id, loaded_block)      
+                self.loaded_blocks[model_id] = None  
+ 
+        self.active_models = []
+        self.active_models_ids = []
+        self.active_subcaches = []
+        torch.cuda.empty_cache()
+        gc.collect()
+        self.last_reserved_mem_check = time.time()
+
+    def move_args_to_gpu(self, *args, **kwargs):
+        new_args= []
+        new_kwargs={}
+        for arg in args:
+            if torch.is_tensor(arg):    
+                if arg.dtype == torch.float32:
+                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
+                elif not arg.is_cuda:
+                    arg = arg.cuda(non_blocking=True)
+            new_args.append(arg)
+
+        for k in kwargs:
+            arg = kwargs[k]
+            if torch.is_tensor(arg):
+                if arg.dtype == torch.float32:
+                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
+                elif not arg.is_cuda:
+                    arg = arg.cuda(non_blocking=True)             
+            new_kwargs[k]= arg
+        
+        return new_args, new_kwargs
+
+    def ready_to_check_mem(self):
+        if self.anyCompiledModule:
+             return
+        cur_clock = time.time()
+        # can't check at each call if we can empty the cuda cache as quering the reserved memory value is a time consuming operation
+        if (cur_clock - self.last_reserved_mem_check)<0.200:
+            return False
+        self.last_reserved_mem_check = cur_clock
+        return True        
+
+
+    def empty_cache_if_needed(self):
+        mem_reserved = torch.cuda.memory_reserved()
+        mem_threshold = 0.9*self.device_mem_capacity
+        if mem_reserved >= mem_threshold:            
+            mem_allocated = torch.cuda.memory_allocated()
+            if mem_allocated <= 0.70 * mem_reserved: 
+                # print(f"Cuda empty cache triggered as Allocated Memory ({mem_allocated/1024000:0f} MB) is lot less than Cached Memory ({mem_reserved/1024000:0f} MB)  ")
+                torch.cuda.empty_cache()
+                tm= time.time()
+                if self.verboseLevel >=2:
+                    print(f"Empty Cuda cache at {tm}")
+                # print(f"New cached memory after purge is {torch.cuda.memory_reserved()/1024000:0f} MB)  ")
+
+
+    def any_param_or_buffer(self, target_module: torch.nn.Module):
+        
+        for _ in target_module.parameters(recurse= False):
+            return True
+        
+        for _ in target_module.buffers(recurse= False):
+            return True
+        
+        return False
+
+    def hook_preload_blocks_for_compilation(self, target_module, model_id,blocks_name, context):
+
+        # @torch.compiler.disable()
+        def preload_blocks_for_compile(module,  *args, **kwargs):
+            some_context = context #for debugging
+            if blocks_name == None:
+                if self.ready_to_check_mem():
+                    self.empty_cache_if_needed()
+            else:                
+                loaded_block = self.loaded_blocks[model_id]
+                if (loaded_block == None or loaded_block != blocks_name) :
+                    if loaded_block != None:
+                        self.gpu_unload_blocks(model_id, loaded_block)
+                        if self.ready_to_check_mem():
+                            self.empty_cache_if_needed()
+                    self.loaded_blocks[model_id] = blocks_name
+                    self.gpu_load_blocks(model_id, blocks_name)
+        # need to be registered before the forward not to be break the efficiency of the compilation chain
+        # it should be at the top of the compilation as this type of hook in the middle of a chain seems to break memory performance
+        target_module.register_forward_pre_hook(preload_blocks_for_compile)        
+
+
+    def hook_check_empty_cache_needed(self, target_module, model_id,blocks_name, previous_method,  context):
+
+        qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
+        if qint4quantization:
+            pass
+
+        def check_empty_cuda_cache(module, *args, **kwargs):
+            # if self.ready_to_check_mem():
+            #     self.empty_cache_if_needed()
+            if blocks_name == None:
+                if self.ready_to_check_mem():
+                    self.empty_cache_if_needed()
+            else:                
+                loaded_block = self.loaded_blocks[model_id]
+                if (loaded_block == None or loaded_block != blocks_name) :
+                    if loaded_block != None:
+                        self.gpu_unload_blocks(model_id, loaded_block)
+                        if self.ready_to_check_mem():
+                            self.empty_cache_if_needed()
+                    self.loaded_blocks[model_id] = blocks_name
+                    self.gpu_load_blocks(model_id, blocks_name)
+            if qint4quantization:
+                args, kwargs = self.move_args_to_gpu(*args, **kwargs)
+
+            return previous_method(*args, **kwargs) 
+
+
+        if hasattr(target_module, "_mm_id"):
+            orig_model_id = getattr(target_module, "_mm_id")
+            if self.verboseLevel >=2:
+                print(f"Model '{model_id}' shares module '{target_module._get_name()}' with module '{orig_model_id}' ")
+            assert not self.any_param_or_buffer(target_module)
+
+            return
+        setattr(target_module, "_mm_id", model_id)
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
+
+        
+    def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
+        def check_change_module(module, *args, **kwargs):
+            performEmptyCacheTest = False
+            if not model_id in self.active_models_ids:
+                new_model_id = getattr(module, "_mm_id") 
+                # do not always unload existing models if it is more efficient to keep in them in the GPU 
+                # (e.g: small modules whose calls are text encoders) 
+                if not self.can_model_be_cotenant(new_model_id) :
+                    self.unload_all()
+                    performEmptyCacheTest = False
+                self.gpu_load(new_model_id)
+            # transfer leftovers inputs that were incorrectly created in the RAM (mostly due to some .device tests that returned incorrectly "cpu")
+            args, kwargs = self.move_args_to_gpu(*args, **kwargs)
+            if performEmptyCacheTest:
+                self.empty_cache_if_needed()
+     
+            return previous_method(*args, **kwargs) 
+  
+        if hasattr(target_module, "_mm_id"):
+            return
+        setattr(target_module, "_mm_id", model_id)
+
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
+
+        if not self.verboseLevel >=1:
+            return
+
+        if module_id == None or module_id =='':
+            model_name = model._get_name()
+            print(f"Hooked in model '{model_id}' ({model_name})")
+
+
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
     """save the weights of a model and quantize them if requested
     These weights can be loaded again using 'load_model_data'
     """       
     
     config = None
-
     verboseLevel = _compute_verbose_level(verboseLevel)
-
-    if hasattr(model, "_config"):
+    if config_file_path !=None:
+        with open(config_file_path, "r", encoding="utf-8") as reader:
+            text = reader.read()
+            config= json.loads(text)
+    elif hasattr(model, "_config"):
         config = model._config
     elif hasattr(model, "config"):
         config_fullpath = None
@@ -1195,7 +1247,7 @@ def save_model(model, file_path, do_quantize = False, quantizationType = qint8, 
         print(f"Saving file '{file_path}")
     safetensors2.torch_write_file(model.state_dict(),  file_path , quantization_map = quantization_map, config = config)
     if verboseLevel >=1:
-        print(f"File '{file_path} saved")
+        print(f"File '{file_path}' saved")
 
 
 
@@ -1286,7 +1338,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
 
     estimatesBytesToPin = 0
-
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
         # make sure that no RAM or GPU memory is not allocated for gradiant / training
@@ -1302,7 +1353,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
 
         for n, p in current_model.named_parameters():
             p.requires_grad = False
-            p = p.detach()
             if isinstance(p, QTensor):
                 # # fix quanto bug (seems to have been fixed)   
                 # if not modelPinned and p._scale.dtype == torch.float32:
@@ -1352,21 +1402,21 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     #  Hook forward methods of modules 
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
-        current_budget = model_budgets[model_id]
-        current_size = 0
-        cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
-        self.loaded_blocks[model_id] = None
         towers_names, towers_modules = _detect_main_towers(current_model)
-        towers_names = [n +"." for n in towers_names]
         if self.verboseLevel>=2 and len(towers_names)>0:
             print(f"Potential iterative blocks found in model '{model_id}':{towers_names}")
         # compile main iterative modules stacks ("towers")
-        if compileAllModels or model_id in modelsToCompile :
+        compilationInThisOne = compileAllModels or model_id in modelsToCompile 
+        if compilationInThisOne:
             if self.verboseLevel>=1:
-                print(f"Pytorch compilation of model '{model_id}' is scheduled.")
-            for tower in towers_modules:
-                for submodel in tower:
-                    submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                if len(towers_modules)>0:
+                    print(f"Pytorch compilation of model '{model_id}' is scheduled.")
+                else:
+                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
+
+            for submodel in towers_modules:
+                # for submodel in tower:
+                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
                     #dynamic=True,
                 
         if pinAllModels or model_id in modelsToPin:
@@ -1376,6 +1426,11 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
             else:
                 _pin_to_memory(current_model, model_id, partialPinning= partialPinning, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel)            
 
+        current_budget = model_budgets[model_id]
+        current_size = 0
+        cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
+        self.loaded_blocks[model_id] = None
+
         for submodule_name, submodule in current_model.named_modules():  
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -1384,44 +1439,43 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
 
             if submodule_name=='':
                 continue
-            newListItem = False
+            
             if current_budget > 0:
-                if isinstance(submodule, (torch.nn.ModuleList, torch.nn.Sequential)): #
-                    if cur_blocks_prefix == None:
-                        cur_blocks_prefix = submodule_name + "."
+                if cur_blocks_prefix != None:
+                    if submodule_name.startswith(cur_blocks_prefix):
+                        depth_prefix = cur_blocks_prefix.split(".")
+                        depth_name = submodule_name.split(".")
+                        level  =  depth_name[len(depth_prefix)-1]                        
+                        pre , num = _extract_num_from_str(level)
+                        if num != cur_blocks_seq and (cur_blocks_seq == -1 or current_size > current_budget): 
+                            prev_blocks_name = cur_blocks_name
+                            cur_blocks_name =  cur_blocks_prefix + str(num)
+                            # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                        cur_blocks_seq = num
                     else:
-                        #if cur_blocks_prefix != submodule_name[:len(cur_blocks_prefix)]:
-                        if not submodule_name.startswith(cur_blocks_prefix):
-                            cur_blocks_prefix = submodule_name + "."
-                            cur_blocks_name,cur_blocks_seq = None, -1
-                else:
-                    
-                    if cur_blocks_prefix is not None:
-                        if submodule_name.startswith(cur_blocks_prefix):
-                            num = int(submodule_name[len(cur_blocks_prefix):].split(".")[0])
-                            newListItem= num != cur_blocks_seq
-                            if num != cur_blocks_seq and (cur_blocks_name == None or current_size > current_budget): 
-                                prev_blocks_name = cur_blocks_name
-                                cur_blocks_name = cur_blocks_prefix + str(num)
-                                # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
-                            cur_blocks_seq = num
-                        else:
-                            cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
 
+                if cur_blocks_prefix == None:
+                    pre , num = _extract_num_from_str(submodule_name)
+                    if isinstance(submodule, (torch.nn.ModuleList, torch.nn.Sequential)):  
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_seq = pre + ".", None, -1
+                    elif num >=0:
+                        cur_blocks_prefix, prev_blocks_name, cur_blocks_seq = pre, None, num
+                        cur_blocks_name = submodule_name
+                        # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                          
+ 
             if hasattr(submodule, "forward"):
                 submodule_method = getattr(submodule, "forward")
                 if callable(submodule_method):   
                     if len(submodule_name.split("."))==1:
                         self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method)
-                    elif newListItem: 
-                        self.hook_load_data_if_needed(submodule, model_id, cur_blocks_name, context = submodule_name )
+                    elif compilationInThisOne and submodule in towers_modules: 
+                        self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
                         self.hook_check_empty_cache_needed(submodule, model_id, cur_blocks_name, submodule_method, context = submodule_name )
 
-
-                    current_size = self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
-
-
+                current_size = self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
 
 
     if self.verboseLevel >=2:
@@ -1467,11 +1521,12 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     models_to_scan = ("text_encoder", "text_encoder_2")
     candidates_to_quantize = ("t5", "llama", "llm")
     for model_id  in models_to_scan:
-        name = module_names[model_id]
-        for candidate in candidates_to_quantize:
-            if candidate in name:
-                default_extraModelsToQuantize.append(model_id)
-                break
+        if model_id in module_names: 
+            name = module_names[model_id]
+            for candidate in candidates_to_quantize:
+                if candidate in name:
+                    default_extraModelsToQuantize.append(model_id)
+                    break
 
 
     # transformer (video or image generator) should be as small as possible not to occupy space that could be used by actual image data
@@ -1480,6 +1535,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     default_budgets = { "transformer" : 600 , "text_encoder": 3000, "text_encoder_2": 3000 }
     extraModelsToQuantize = None
     asyncTransfers = True
+    budgets = None
 
     if profile_no == profile_type.HighRAM_HighVRAM:
         pinnedMemory= True

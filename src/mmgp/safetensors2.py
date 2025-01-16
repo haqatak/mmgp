@@ -156,19 +156,32 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
     pos = 0
     i = 0
     mx = 100000
+    metadata = dict()
     for k , t  in sd.items():
-        entry = {}
-        dtypestr= map[t.dtype]
-        entry["dtype"] = dtypestr  
-        entry["shape"] = list(t.shape)
-        size = torch.numel(t) * t.element_size()
-        entry["data_offsets"] = [pos, pos + size]
-        pos += size
-        sf_sd[k] = entry
+        if torch.is_tensor(t):
+            entry = {}
+            dtypestr= map[t.dtype]
+            entry["dtype"] = dtypestr  
+            entry["shape"] = list(t.shape)
+            size = torch.numel(t) * t.element_size()
+            if size == 0:
+                pass
+            entry["data_offsets"] = [pos, pos + size]
+            pos += size
+            sf_sd[k] = entry
+        else:
+            if isinstance(t, str):
+                metadata[k] = t
+            else:
+                try:
+                    b64 = base64.b64encode(json.dumps(t, ensure_ascii=False).encode('utf8')).decode('utf8')
+                    metadata[k + "_base64"] = b64 
+                except:
+                    pass
+
         i+=1
         if i==mx:
             break
-    metadata = dict()
     if not quantization_map is None:
         metadata["quantization_format"] = "quanto"
         metadata["quantization_map_base64"] =  base64.b64encode(json.dumps(quantization_map, ensure_ascii=False).encode('utf8')).decode('utf8')  
@@ -192,9 +205,9 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
 
         i = 0
         for k , t  in sd.items():
-            size = torch.numel(t) * t.element_size()
-            if size != 0:
-                if len(t.shape) == 0:
+            if torch.is_tensor(t):
+                size = torch.numel(t) * t.element_size()
+                if size != 0:
                     dtype = t.dtype
                     # convert in a friendly format, scalars types not supported by numpy
                     if  dtype ==  torch.bfloat16:
@@ -202,11 +215,8 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
                     elif  dtype ==  torch.float8_e5m2 or dtype ==  torch.float8_e4m3fn:
                         t = t.view(torch.uint8)
                     buffer = t.numpy().tobytes()
-                else:
-                    buffer = t.view(torch.uint8).numpy().tobytes()
-                bytes_written = writer.write(buffer)            
-                assert bytes_written == size
-                
+                    bytes_written = writer.write(buffer)            
+                    assert bytes_written == size                    
             i+=1
             if i==mx:
                 break
@@ -297,13 +307,12 @@ class SafeTensorFile:
                 length = data_offsets[1]-data_offsets[0]
                 map_idx = next(iter_tensor_no)
                 offset = current_pos - maps[map_idx][1]
-                if len(shape) == 0:
-                    if length == 0: 
-                        t = torch.empty(0, dtype=dtype)
-                    else:
-                        # don't waste a memory view for a scalar
-                        t = torch.frombuffer(bytearray(maps[map_idx][0][offset:offset + length]), dtype=torch.uint8)
-                        t = t.view(dtype)                        
+                if length == 0: 
+                    t = torch.empty(shape, dtype=dtype)
+                elif len(shape) == 0:
+                    # don't waste a memory view for a scalar
+                    t = torch.frombuffer(bytearray(maps[map_idx][0][offset:offset + length]), dtype=torch.uint8)
+                    t = t.view(dtype)                        
                 else:
                     mv = memoryview(maps[map_idx][0])[offset:offset + length]                
                     t = torch.frombuffer(mv, dtype=dtype)

@@ -83,7 +83,7 @@ For example:
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
-- compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. As of 01/01/2025 it will work only on Linux or WSL since compilation relies on Triton which is not yet supported on Windows
+- compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. It makes sens to compile only the model that is frequently used such as the "transformer" model in the case of video or image generation. As of 01/01/2025 it will work only on Linux or WSL since compilation relies on Triton which is not yet supported on Windows
 
 If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization, it will be faster and consume slightly less RAM.
  

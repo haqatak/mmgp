@@ -3,3 +3,4 @@ optimum-quanto
 accelerate
 safetensors
 psutil
+peft
