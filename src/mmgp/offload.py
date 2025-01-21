@@ -576,7 +576,7 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
     if hasattr(model_to_quantize, "_quanto_map"):
         for k, entry in model_to_quantize._quanto_map.items():
             weights  =  entry["weights"]
-            print(f"Model '{model_id}' is already quantized in format '{weights}'")
+            print(f"Model '{model_id}' is already quantized to format '{weights}'")
             return False
         print(f"Model '{model_id}' is already quantized")
         return False
@@ -680,7 +680,7 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
 
     return True
 
-def load_loras_into_model(model, lora_path, lora_multi = None, verboseLevel = -1):
+def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, verboseLevel = -1,):
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     if inject_adapter_in_model == None or set_weights_and_activate_adapters == None or  get_peft_kwargs == None:
@@ -731,9 +731,6 @@ def load_loras_into_model(model, lora_path, lora_multi = None, verboseLevel = -1
 
         # is_correct_format = all("lora" in key for key in state_dict.keys())
 
-
-
-
         # check with first key if is not in peft format
         # first_key = next(iter(state_dict.keys()))
         # if "lora_A" not in first_key:
@@ -770,7 +767,17 @@ def load_loras_into_model(model, lora_path, lora_multi = None, verboseLevel = -1
                 pass
         if verboseLevel >=1:
             print(f"Lora '{path}' was loaded in model '{_get_module_name(model)}'")
-    set_weights_and_activate_adapters(model,[ str(i) for i in range(len(lora_multi))], lora_multi)
+    if activate_all_loras:
+        set_weights_and_activate_adapters(model,[ str(i) for i in range(len(lora_multi))], lora_multi)
+
+def activate_loras(model, lora_nos, lora_multi = None ):
+    if not isinstance(lora_nos, list):
+        lora_nos = [lora_nos]
+    lora_nos = [str(l) for l in lora_nos]
+    if lora_multi is None:
+        lora_multi = [1. for _ in lora_nos]
+    set_weights_and_activate_adapters(model, lora_nos, lora_multi)
+
 
 def move_loras_to_device(model, device="cpu" ):
     if hasattr( model, "_lora_loadable_modules"):
@@ -1617,7 +1624,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets=default_budgets
         budgets["transformer"] = 400
-        asyncTransfers = False
+        #asyncTransfers = False
         info = "You have chosen the slowest profile that requires at least 24 GB of RAM and 10 GB of VRAM."
     else:
         raise Exception("Unknown profile")
