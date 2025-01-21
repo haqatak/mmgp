@@ -262,6 +262,7 @@ class SafeTensorFile:
 
         PAGE_SIZE =  mmap.ALLOCATIONGRANULARITY 
         MMAP_SIZE = 1024 * 1024 * 1024  # 1GB
+        # MMAP_SIZE = 256 * 1024 * 1024  # 1GB
 
         # First pass: find optimal aligned map boundaries
         skip_bytes = self._skip_bytes
@@ -322,6 +323,7 @@ class SafeTensorFile:
                 current_pos += length
 
         return sd
+        
 
     def create_tensors_without_mmap(self):
         sd = OrderedDict()    
@@ -335,12 +337,11 @@ class SafeTensorFile:
                 data_offsets = v["data_offsets"]
                 length = data_offsets[1]-data_offsets[0]
                 buffer = f.read(length)
-                if len(shape) == 0:
-                    if length == 0: 
-                        t = torch.empty(0, dtype=dtype)
-                    else:
-                        t = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
-                        t = t.view(dtype)                        
+                if length == 0: 
+                    t = torch.empty(0, dtype=dtype)
+                elif len(shape) == 0:
+                    t = torch.frombuffer(bytearray(buffer), dtype=torch.uint8)
+                    t = t.view(dtype)                        
                 else:
                     t = torch.frombuffer(bytearray(buffer), dtype=dtype)
                     t = torch.reshape(t, shape)
