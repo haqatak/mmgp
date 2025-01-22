@@ -986,14 +986,13 @@ class offload:
             self.blocks_of_modules[entry_name] = blocks_params
             blocks_params_size = 0
             if blocks_name !=None:
-
                 prev_entry_name = None if prev_block_name == None else  model_id + "/" + prev_block_name
                 self.prev_blocks_names[entry_name] =  prev_entry_name
                 if not prev_block_name == None:
                     self.next_blocks_names[prev_entry_name] = entry_name        
 
-
         for k,p in submodule.named_parameters(recurse=False):
+
             if isinstance(p, QTensor):
                 blocks_params.append( (submodule, k, p, False ) )
 
@@ -1275,7 +1274,7 @@ class offload:
 
         if module_id == None or module_id =='':
             model_name = model._get_name()
-            print(f"Hooked in model '{model_id}' ({model_name})")
+            print(f"Hooked to model '{model_id}' ({model_name})")
 
 
 def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
@@ -1318,7 +1317,29 @@ def save_model(model, file_path, do_quantize = False, quantizationType = qint8, 
         print(f"File '{file_path}' saved")
 
 
+def extract_models(prefix, obj):
+    pipe = {}
+    for name in dir(obj):            
+        element = getattr(obj,name)
+        if name  in ("pipeline", "pipe"):
+            pipeline = element
+            if  hasattr(pipeline , "components") and isinstance(pipeline.components, dict):
+                for k, model in pipeline.components.items():
+                    if model != None:
+                        pipe[prefix  + "/" + k ] = model
+        elif isinstance(element, torch.nn.Module): 
+            if prefix  + "/" + name in pipe:
+                pipe[prefix  + "/_" + name ] = element
+            else:
+                pipe[prefix  + "/" + name ] = element
+        elif isinstance(element, dict):
+            for k, element in element.items():
+                if  hasattr(element , "pipeline"):
+                    pipe.update( extract_models(prefix + "/" + k,element ))
 
+
+    return pipe
+    
 
 def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
@@ -1344,6 +1365,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
     if not budgets is None:
         if isinstance(budgets , dict):
             model_budgets = budgets
+            budget = budgets.get("*", 0) * ONE_MB
         else:
             budget = int(budgets) * ONE_MB
 
@@ -1458,7 +1480,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
         if  model_budget > 0 and model_budget > current_model_size:
             model_budget = 0
         
-        model_budgets[model_id] = model_budget
+        model_budgets[model_id] = model_budget #/ 2 if asyncTransfers else model_budget 
 
     partialPinning = False
 
@@ -1502,10 +1524,11 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
             if  not hasattr(submodule, "_hf_hook"):
                 setattr(submodule, "_hf_hook", HfHook())
 
-            if submodule_name=='':
-                continue
-            
-            if current_budget > 0:
+            # if submodule_name=='':
+            #     continue
+
+
+            if current_budget > 0 and len(submodule_name) > 0:
                 if cur_blocks_prefix != None:
                     if submodule_name.startswith(cur_blocks_prefix):
                         depth_prefix = cur_blocks_prefix.split(".")
@@ -1515,7 +1538,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                         if num != cur_blocks_seq and (cur_blocks_seq == -1 or current_size > current_budget): 
                             prev_blocks_name = cur_blocks_name
                             cur_blocks_name =  cur_blocks_prefix + str(num)
-                            # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                            print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
                         cur_blocks_seq = num
                     else:
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
@@ -1527,7 +1550,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                     elif num >=0:
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq = pre, None, num
                         cur_blocks_name = submodule_name
-                        # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                        print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
                           
  
             if hasattr(submodule, "forward"):
@@ -1597,37 +1620,45 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     # transformer (video or image generator) should be as small as possible not to occupy space that could be used by actual image data
     # on the other hand the text encoder should be quite large (as long as it fits in 10 GB of VRAM) to reduce sequence offloading
 
-    default_budgets = { "transformer" : 600 , "text_encoder": 3000, "text_encoder_2": 3000 }
+    budgets = {}
+    if "transformer" in modules:
+        budgets["transformer"] = 1200    
+
     extraModelsToQuantize = None
     asyncTransfers = True
-    budgets = None
 
     if profile_no == profile_type.HighRAM_HighVRAM:
         pinnedMemory= True
         budgets = None
-        info = "You have chosen a profile that requires at least 48 GB of RAM and 24 GB of VRAM. Some VRAM is consuming just to make the model runs faster."
+        info = "You have chosen a profile that requires at least 48 GB of RAM and 24 GB of VRAM. Some VRAM is consumed just to make the model runs faster."
     elif profile_no == profile_type.HighRAM_LowVRAM:
         pinnedMemory= True
-        budgets = default_budgets
+        budgets["*"] =  3000
         info = "You have chosen a profile that requires at least 48 GB of RAM and 12 GB of VRAM. Some RAM is consumed to reduce VRAM consumption."
     elif profile_no == profile_type.LowRAM_HighVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
+        budgets = None
         info = "You have chosen a Medium speed profile that requires at least 32 GB of RAM and 24 GB of VRAM. Some VRAM is consuming just to make the model runs faster"
     elif profile_no == profile_type.LowRAM_LowVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
-        budgets=default_budgets
+        budgets["*"] =  3000
         info = "You have chosen a profile that requires at least 32 GB of RAM and 12 GB of VRAM. Some RAM is consumed to reduce VRAM consumption. "
     elif profile_no == profile_type.VerylowRAM_LowVRAM:
         pinnedMemory= False
         extraModelsToQuantize = default_extraModelsToQuantize
-        budgets=default_budgets
-        budgets["transformer"] = 400
+        budgets["*"] =  3000
+        if "transformer" in modules:
+            budgets["transformer"] = 400    
         #asyncTransfers = False
         info = "You have chosen the slowest profile that requires at least 24 GB of RAM and 10 GB of VRAM."
     else:
         raise Exception("Unknown profile")
+    
+    if budgets != None and len(budgets) == 0:
+        budgets = None
+
     CrLf = '\r\n'
     kwargs = { "pinnedMemory": pinnedMemory,  "extraModelsToQuantize" : extraModelsToQuantize, "budgets": budgets, "asyncTransfers" : asyncTransfers, "quantizeTransformer": quantizeTransformer   }
 
