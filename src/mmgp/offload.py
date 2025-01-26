@@ -154,7 +154,7 @@ def _get_max_reservable_memory(perc_reserved_mem_max):
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
     return  perc_reserved_mem_max * physical_memory
 
-def _detect_main_towers(model, min_floors = 5, verboseLevel=1):
+def _detect_main_towers(model, min_floors = 5):
     cur_blocks_prefix = None
     towers_modules= []
     towers_names= []
@@ -200,29 +200,6 @@ def _detect_main_towers(model, min_floors = 5, verboseLevel=1):
     if len(floors_modules) >= min_floors:
         towers_modules += floors_modules
         towers_names.append(tower_name)
-
-    # for submodule_name, submodule in model.named_modules():  
-    #     if submodule_name=='':
-    #         continue
-
-    #     if isinstance(submodule, torch.nn.ModuleList):
-    #         newList =False
-    #         if cur_blocks_prefix == None:
-    #             cur_blocks_prefix = submodule_name + "."
-    #             newList = True
-    #         else:
-    #             if not submodule_name.startswith(cur_blocks_prefix):
-    #                 cur_blocks_prefix = submodule_name + "."
-    #                 newList = True
-
-    #         if newList and len(submodule)>=5:
-    #             towers_names.append(submodule_name)
-    #             towers_modules.append(submodule)
-                
-    #     else:                
-    #         if cur_blocks_prefix is not None:
-    #             if not submodule_name.startswith(cur_blocks_prefix):
-    #                 cur_blocks_prefix = None 
 
     return towers_names, towers_modules
 
@@ -461,13 +438,14 @@ def _welcome():
     print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
-    for i in range(len(num_in_str)):
+    size = len(num_in_str)
+    for i in range(size):
         if not num_in_str[-i-1:].isnumeric():
             if i == 0:
                 return num_in_str, -1
             else:             
                 return num_in_str[: -i],  int(num_in_str[-i:])                    
-    return  "", int(num_in_str)
+    return  "", -1 if size == 0 else int(num_in_str)
 
 def  _quantize_dirty_hack(model):
     # dirty hack: add a hook on state_dict() to return a fake non quantized state_dict if called by Lora Diffusers initialization functions
@@ -1538,7 +1516,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                         if num != cur_blocks_seq and (cur_blocks_seq == -1 or current_size > current_budget): 
                             prev_blocks_name = cur_blocks_name
                             cur_blocks_name =  cur_blocks_prefix + str(num)
-                            print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                            # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
                         cur_blocks_seq = num
                     else:
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
@@ -1550,7 +1528,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                     elif num >=0:
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq = pre, None, num
                         cur_blocks_name = submodule_name
-                        print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
+                        # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
                           
  
             if hasattr(submodule, "forward"):

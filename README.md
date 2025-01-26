@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.1.3 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.1.4 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -9,10 +9,10 @@ This a replacement for the accelerate library that should in theory manage offlo
 times in a pipe (eg VAE).
 
 Requirements:
-- VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090) 
+- VRAM: minimum 6 GB, recommended 24 GB (RTX 3090/ RTX 4090) 
 - RAM: minimum 24 GB, recommended 48 GB 
 
-This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (32 GB of RAM and 12 VRAM) and to run it at a very good speed (if not the best) on a high end consumer config (48 GB of RAM and 24 GB of VRAM).\
+This module features 5 profiles in order to able to run the model at a decent speed on a low end consumer config (24 GB of RAM and 6 VRAM) and to run it at a very good speed (if not the best) on a high end consumer config (48 GB of RAM and 24 GB of VRAM).\
 These RAM requirements are for Linux systems. Due to different memory management Windows will require an extra 16 GB of RAM to run the corresponding profile.
 
 Each profile may use a combination of the following: 
@@ -24,11 +24,11 @@ Each profile may use a combination of the following:
 - Automated on the fly quantization or ability to load pre quantized models
 - Pretrained Lora support with low RAM requirements
 - Support for pytorch compilation on Linux and WSL (supported on pure Windows but requires a complex Triton Installation).
-- 
+
 ## Sample applications that use mmgp
 It is recommended to have a look at these applications to see how mmgp was implemented in each of them:
 - Hunyuan3D-2GP: https://github.com/deepbeepmeep/Hunyuan3D-2GP\
-A great image to 3D or text to 3D tool by the Tencent team. Thanks to mmgp it can run with less than 6 GB of VRAM
+A great image to 3D and text to 3D tool by the Tencent team. Thanks to mmgp it can run with less than 6 GB of VRAM
 
 - HuanyuanVideoGP: https://github.com/deepbeepmeep/HunyuanVideoGP\
 One of the best open source Text to Video generator
@@ -39,6 +39,8 @@ One of the best inpainting / outpainting tools based on Flux that can run with l
 - Cosmos1GP: https://github.com/deepbeepmeep/Cosmos1GP\
 This application include two models: a text to world generator and a image / video to world (probably the best open source image to video generator).
 
+- OminiControlGP: https://github.com/deepbeepmeep/OminiControlGP\
+A Flux derived application very powerful that can be used to transfer an object of your choice in a prompted scene. With mmgp you can run it with only 6 GB of VRAM.
 
 
 ## Installation
@@ -73,7 +75,7 @@ Profile 2 (High RAM) and 4 (Low RAM)are the most recommended profiles since they
 If you use Flux derived applciation profile 1 and 3 will offer much faster generation times.
 In any case, a safe approach is to start from profile 5 (default profile) and then go down progressively to profile 4 and then to profile 2 as long as the app remains responsive or doesn't trigger any out of memory error.
 
-By default the 'transformer' will be quantized to 8 bits for all profiles. If you don't want that you may specify the optional parameter *quantizeTransformer = False*.
+By default the model named 'transformer' will be quantized to 8 bits for all profiles. If you don't want that you may specify the optional parameter *quantizeTransformer = False*.
 
 Every parameter set automatically by a profile can be overridden with one or multiple parameters accepted by *offload.all* (see below):
 ```
@@ -99,13 +101,20 @@ For example:
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
-- compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. It makes sens to compile only the model that is frequently used such as the "transformer" model in the case of video or image generation. As of 01/01/2025 it will work only on Linux or WSL since compilation relies on Triton which is not yet supported on Windows
+- compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. It makes sense to compile only the model that is frequently used such as the "transformer" model in the case of video or image generation. Compilation requires Triton to be installed. Triton is available out of the box on Linux or WSL but requires to be installed with Windows: https://github.com/woct0rdho/triton-windows
 
 If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization, it will be faster and consume slightly less RAM.
  
 ##  Going further
 
 The module includes several tools to package a light version of your favorite video / image generator:
+- *extract_models(string prefix,  obj to explore)*\
+This tool will try to detect for you models that are embedded in a pipeline or in some custom class. It will save you time by building a pipe dictionary required par *offload.all* or "offload.profile*. The prefix correponds to the text that will appear before the name of each model in the dictionary.
+
+- *load_loras_into_model(model, lora_path, lora_multi)*\
+Load in a model a list of Lora described by a list of path *lora_path* and a list of *weights coefficients*.
+The Lora file must be in the *diffusers* format. This function works also on non diffusers models. However if there is already an official Lora support for a model it is recommended to use the official diffusers functions.
+
 - *save_model(model, file_path, do_quantize = False, quantizationType = qint8 )*\
 Save tensors of a model already loaded in memory in a safetensor format (much faster to reload). You can save it in a quantized format (default qint8 quantization recommended).
 The resulting safetensor file will contain extra fields in its metadata such as the quantization map and its configuration, so you will be able to move the file around without files such as *config.json* or *file_map.json*.
@@ -119,16 +128,13 @@ Initialize (build the model hierarchy in memory) and fast load the corresponding
 The advantages over the original *from_pretrained* method is that a full model can fit into a single file with a filename of your choosing (thefore you can have multiple 'transformers' versions of the same model in the same directory) and prequantized models are processed in a transparent way. 
 Last but not least, you can also on the fly pin to RAM the whole model or the most important part of it (partialPin = True) in a more efficient way (faster and requires less RAM) than if you did through *offload.all* or *offload.profile*.
 
-- *load_loras_into_model(model, lora_path, lora_multi)
-Load in a model a list of Lora described by a list of path *lora_path* and a list of *weights coefficients*.
-The Lora file must be in the *diffusers* format. This function works also on non diffusers models. However if there is already an official Lora support for a model it is recommended to use the official diffusers functions.
 
 The typical workflow wil be:
 1) temporarly insert the *save_model* function just after a model has been fully loaded to save a copy of the model / quantized model.
 2) replace the full initalizing / loading logic with *fast_load_transformers_model* (if there is a *from_pretrained* call to a transformers object) or only the tensor loading functions (*torch.load_model_file* and *torch.load_state_dict*) with *load_model_data after* the initializing logic.
 
 ## Special cases
-Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.\
+Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you may try to use *extract_models* or create a dictionary that manually maps all the models.\
 For instance :
 
 
@@ -142,9 +148,9 @@ pipe = { "text_encoder": self.text_encoder, "transformer": self.dit, "vae":self.
 ```
 
 
-Please note that there should be always one model whose Id is 'transformer'. It corresponds to the main image / video model which usually needs to be quantized (this is done on the fly by default when loading the model).
+Please note it is recommended to have always one model whose Id is 'transformer' so that you can leverage predefined profiles. The 'transformer' corresponds to the main image / video model which usually needs to be quantized (this is done on the fly by default when loading the model).
 
-Becareful, lots of models use the T5 XXL as a text encoder. However, quite often their corresponding pipeline configurations point at the official Google T5 XXL repository 
+Be careful, lots of models use the T5 XXL as a text encoder. However, quite often their corresponding pipeline configurations point at the official Google T5 XXL repository 
 where there is a huge 40GB model to download and load. It is cumbersorme as it is a 32 bits model and contains the decoder part of T5 that is not used. 
 I suggest you use instead one of the 16 bits encoder only version available around, for instance:
 ```
