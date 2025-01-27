@@ -149,10 +149,10 @@ def _compute_verbose_level(level):
     safetensors2.verboseLevel = level
     return level
 
-def _get_max_reservable_memory(perc_reserved_mem_max):
+def _get_perc_reserved_mem_max(perc_reserved_mem_max):
     if perc_reserved_mem_max<=0:             
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
-    return  perc_reserved_mem_max * physical_memory
+    return  perc_reserved_mem_max 
 
 def _detect_main_towers(model, min_floors = 5):
     cur_blocks_prefix = None
@@ -191,10 +191,10 @@ def _detect_main_towers(model, min_floors = 5):
             pre , num = _extract_num_from_str(submodule_name)
             if isinstance(submodule, (torch.nn.ModuleList)):  
                 cur_blocks_prefix, cur_blocks_seq = pre + ".",  -1
-                tower_name = submodule_name + ".*" 
+                tower_name = submodule_name #+ ".*" 
             elif num >=0:
                 cur_blocks_prefix, cur_blocks_seq = pre, num
-                tower_name = submodule_name[ :-1] + "*" 
+                tower_name = submodule_name[ :-1] #+ "*" 
                 floors_modules.append(submodule)
 
     if len(floors_modules) >= min_floors:
@@ -238,30 +238,7 @@ def _remove_model_wrapper(model):
         return sub_module
     return model  
 
-    # def force_load_tensor(t):
-    #     c = torch.nn.Parameter(t + 0)
-    #     torch.utils.swap_tensors(t, c)
-    #     del c
-
-
-    # for n,m in model_to_quantize.named_modules():
-    #     # do not read quantized weights (detected them directly or behind an adapter)
-    #     if isinstance(m, QModuleMixin) or hasattr(m, "base_layer") and  isinstance(m.base_layer, QModuleMixin): 
-    #         if hasattr(m, "bias") and m.bias is not None:
-    #             force_load_tensor(m.bias.data)
-    #             # m.bias.data = m.bias.data + 0 
-    #     else:
-    #         for n, p in m.named_parameters(recurse = False):
-    #             data = getattr(m, n)
-    #             force_load_tensor(data)
-    #             # setattr(m,n, torch.nn.Parameter(data + 0 ) )
-
-    #     for b in m.buffers(recurse = False):
-    #         # b.data = b.data + 0 
-    #         b.data = torch.nn.Buffer(b.data + 0) 
-    #         force_load_tensor(b.data)
-
-
+ 
 
 def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
     dtype= source_tensor.dtype
@@ -301,17 +278,11 @@ def _force_load_parameter(p):
     torch.utils.swap_tensors(p, q)
     del q
 
-def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_max = 0, verboseLevel = 1):
-    if  verboseLevel>=1 :
-        if partialPinning:
-            print(f"Partial pinning of data of '{model_id}' to reserved RAM")
-        else:            
-            print(f"Pinning data of '{model_id}' to reserved RAM")
+def _pin_to_memory(model, model_id, partialPinning = False, verboseLevel = 1):
 
-    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
+
     if partialPinning:
         towers_names, _ = _detect_main_towers(model)
-        towers_names = [n +"." for n in towers_names]
 
 
     BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
@@ -329,6 +300,20 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
         if include:
             params_list = params_list +  [ (k + '.' + n, p,  False)  for n, p in sub_module.named_parameters(recurse=False)] +  [ (k + '.' + n, p,  True)  for n, p in sub_module.named_buffers(recurse=False)] 
   
+
+    if  verboseLevel>=1 :
+        if partialPinning:
+            if len(params_list) == 0:
+                print(f"Unable to apply Partial of '{model_id}' as no isolated main structures were found")
+            else:
+                print(f"Partial pinning of data of '{model_id}' to reserved RAM")
+        else:            
+            print(f"Pinning data of '{model_id}' to reserved RAM")
+
+    if partialPinning and len(params_list) == 0:
+        return
+
+
 
     for n, p, _ in params_list:
         if isinstance(p, QTensor):
@@ -419,10 +404,10 @@ def _pin_to_memory(model, model_id, partialPinning = False, perc_reserved_mem_ma
     gc.collect()
 
     if verboseLevel >=1:
-        if total_tensor_bytes <= total:        
-            print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+        if partialPinning:        
+            print(f"The model was partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
         else:
-            print(f"{total/ONE_MB:.2f} MB were pinned to reserved RAM out of {total_tensor_bytes/ONE_MB:.2f} MB")
+            print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
 
     model._already_pinned = True
 
@@ -1403,7 +1388,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
       #  torch._logging.set_logs(recompiles=True)
       #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
 
-    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max)
+     
+    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max) 
+    max_reservable_memory = perc_reserved_mem_max * physical_memory
 
     estimatesBytesToPin = 0
     for model_id in models: 
@@ -1464,7 +1451,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
 
     if estimatesBytesToPin > 0 and estimatesBytesToPin >= (max_reservable_memory - total_pinned_bytes):
         if self.verboseLevel >=1:
-            print(f"Switching to partial pinning since full requirements for pinned models is {estimatesBytesToPin/ONE_MB:0.1f} MB while estimated reservable RAM is {max_reservable_memory/ONE_MB:0.1f} MB" )
+            print(f"Switching to partial pinning since full requirements for pinned models is {estimatesBytesToPin/ONE_MB:0.1f} MB while estimated reservable RAM is {max_reservable_memory/ONE_MB:0.1f} MB. You may increase the value of parameter 'perc_reserved_mem_max' to a value higher than {perc_reserved_mem_max:0.2f} to force full pinnning." )
         partialPinning = True
 
     #  Hook forward methods of modules 
@@ -1476,7 +1463,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
         if compilationInThisOne:
             if self.verboseLevel>=1:
                 if len(towers_modules)>0:
-                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {towers_names}.")
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {towers_names}*.")
                 else:
                     print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
 
@@ -1489,7 +1476,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                 if self.verboseLevel >=1:
                     print(f"Model '{model_id}' already pinned to reserved memory")
             else:
-                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, perc_reserved_mem_max=perc_reserved_mem_max, verboseLevel=verboseLevel)            
+                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, verboseLevel=verboseLevel)            
 
         current_budget = model_budgets[model_id]
         current_size = 0
