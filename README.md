@@ -99,7 +99,7 @@ For example:
 - pinnedMemory: Boolean (for all models) or List of models ids to pin to RAM. Every model pinned to RAM will load much faster (up to 2 times) but this requires more RAM
 - quantizeTransformer: boolean by default True. The 'transformer' model in the pipe contains usually the video or image generator is by defaut; quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. If you don't want to quantize the image generator, you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 - extraModelsToQuantize: list of additional modelids of models to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
-- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. 
+- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in  VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. 
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
@@ -111,7 +111,7 @@ If you are short on RAM and plan to work with quantized models, it is recommende
 
 The module includes several tools to package a light version of your favorite video / image generator:
 - *extract_models(string prefix,  obj to explore)*\
-This tool will try to detect for you models that are embedded in a pipeline or in some custom class. It will save you time by building a pipe dictionary required par *offload.all* or "offload.profile*. The prefix correponds to the text that will appear before the name of each model in the dictionary.
+This tool will try to detect for you models that are embedded in a pipeline or in some custom class. It will save you time by building a pipe dictionary required by *offload.all* or "offload.profile*. The prefix correponds to the text that will appear before the name of each model in the dictionary.
 
 - *load_loras_into_model(model, lora_path, lora_multi)*\
 Load in a model a list of Lora described by a list of path *lora_path* and a list of *weights coefficients*.
