@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.1.4 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.1.4-15 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -42,6 +42,8 @@ This application include two models: a text to world generator and a image / vid
 - OminiControlGP: https://github.com/deepbeepmeep/OminiControlGP\
 A Flux derived application very powerful that can be used to transfer an object of your choice in a prompted scene. With mmgp you can run it with only 6 GB of VRAM.
 
+- YuE GP: https://github.com/deepbeepmeep/YuEGP/
+A great song generator (instruments + singer's voice) based on prompted Lyrics and a genre description. Thanks to mmgp you can run it with less than 10 GB of VRAM without waiting forever.
 
 ## Installation
 First you need to install the module in your current project with:
@@ -97,7 +99,7 @@ For example:
 - pinnedMemory: Boolean (for all models) or List of models ids to pin to RAM. Every model pinned to RAM will load much faster (up to 2 times) but this requires more RAM
 - quantizeTransformer: boolean by default True. The 'transformer' model in the pipe contains usually the video or image generator is by defaut; quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. If you don't want to quantize the image generator, you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 - extraModelsToQuantize: list of additional modelids of models to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
-- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the budget in VRAM (in fact the real number is 1.5 this number or 2.5 if asyncTransfers are also enabled) that is allocated in VRAM for each model. 
+- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. 
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes

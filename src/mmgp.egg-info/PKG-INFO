@@ -1,6 +1,6 @@
 Metadata-Version: 2.2
 Name: mmgp
-Version: 3.1.4
+Version: 3.1.4.post15
 Summary: Memory Management for the GPU Poor
 Author-email: deepbeepmeep <deepbeepmeep@yahoo.com>
 License:                     GNU GENERAL PUBLIC LICENSE

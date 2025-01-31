@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.1.4 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -191,10 +191,10 @@ def _detect_main_towers(model, min_floors = 5):
             pre , num = _extract_num_from_str(submodule_name)
             if isinstance(submodule, (torch.nn.ModuleList)):  
                 cur_blocks_prefix, cur_blocks_seq = pre + ".",  -1
-                tower_name = submodule_name #+ ".*" 
+                tower_name = submodule_name + "." 
             elif num >=0:
                 cur_blocks_prefix, cur_blocks_seq = pre, num
-                tower_name = submodule_name[ :-1] #+ "*" 
+                tower_name = submodule_name[ :-1]  
                 floors_modules.append(submodule)
 
     if len(floors_modules) >= min_floors:
@@ -420,7 +420,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1.4-15) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
@@ -598,9 +598,13 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 10
 
     perc_excluded =total_excluded/ total_size if total_size >0 else 1
     if verboseLevel >=2:
-        print(f"Total Excluded {total_excluded/ONE_MB:.1f} MB oF {total_size/ONE_MB:.1f} that is {perc_excluded*100:.2f}%")
+        if total_excluded == 0:
+            print(f"Can't find any module to exclude from quantization, full model ({total_size/ONE_MB:.1f} MB) will be quantized")
+        else:
+            print(f"Total Excluded {total_excluded/ONE_MB:.1f} MB of {total_size/ONE_MB:.1f} that is {perc_excluded*100:.2f}%")
     if perc_excluded >= 0.10:
-        print(f"Too many modules are excluded, there is something wrong with the selection, switch back to full quantization.")
+        if verboseLevel >=2:
+            print(f"Too many modules are excluded, there is something wrong with the selection, switch back to full quantization.")
         exclude_list = None
 
 
@@ -905,6 +909,69 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
 
     return
 
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
+    """save the weights of a model and quantize them if requested
+    These weights can be loaded again using 'load_model_data'
+    """       
+    
+    config = None
+    verboseLevel = _compute_verbose_level(verboseLevel)
+    if config_file_path !=None:
+        with open(config_file_path, "r", encoding="utf-8") as reader:
+            text = reader.read()
+            config= json.loads(text)
+    elif hasattr(model, "_config"):
+        config = model._config
+    elif hasattr(model, "config"):
+        config_fullpath = None
+        config_obj = getattr(model,"config")
+        config_path = getattr(config_obj,"_name_or_path", None)
+        if config_path != None:
+            config_fullpath = os.path.join(config_path, "config.json")      
+            if not os.path.isfile(config_fullpath):
+                config_fullpath = None
+        if config_fullpath is None:                            
+            config_fullpath =  os.path.join(os.path.dirname(file_path), "config.json")
+        if os.path.isfile(config_fullpath):
+            with open(config_fullpath, "r", encoding="utf-8") as reader:
+                text = reader.read()
+                config= json.loads(text)
+
+    if do_quantize:
+        _quantize(model, weights=quantizationType, model_id=file_path)
+    
+    quantization_map = getattr(model, "_quanto_map", None)
+
+    if verboseLevel >=1:
+        print(f"Saving file '{file_path}")
+    safetensors2.torch_write_file(model.state_dict(),  file_path , quantization_map = quantization_map, config = config)
+    if verboseLevel >=1:
+        print(f"File '{file_path}' saved")
+
+
+def extract_models(prefix, obj):
+    pipe = {}
+    for name in dir(obj):            
+        element = getattr(obj,name)
+        if name  in ("pipeline", "pipe"):
+            pipeline = element
+            if  hasattr(pipeline , "components") and isinstance(pipeline.components, dict):
+                for k, model in pipeline.components.items():
+                    if model != None:
+                        pipe[prefix  + "/" + k ] = model
+        elif isinstance(element, torch.nn.Module): 
+            if prefix  + "/" + name in pipe:
+                pipe[prefix  + "/_" + name ] = element
+            else:
+                pipe[prefix  + "/" + name ] = element
+        elif isinstance(element, dict):
+            for k, element in element.items():
+                if  hasattr(element , "pipeline"):
+                    pipe.update( extract_models(prefix + "/" + k,element ))
+
+
+    return pipe
+
 def get_model_name(model):
     return model.name
 
@@ -931,6 +998,7 @@ class offload:
         self.loaded_blocks = {}
         self.prev_blocks_names = {}
         self.next_blocks_names = {}
+        self.preloaded_blocks_per_model = {}
         self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
         self.transfer_stream = torch.cuda.Stream()
         self.async_transfers = False
@@ -940,6 +1008,8 @@ class offload:
         
     def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name):
 
+        if blocks_name is None:
+            pass
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         if entry_name in self.blocks_of_modules:
             blocks_params = self.blocks_of_modules[entry_name]
@@ -994,11 +1064,9 @@ class offload:
         return True
 
     @torch.compiler.disable()
-    def gpu_load_blocks(self, model_id, blocks_name):
+    def gpu_load_blocks(self, model_id, blocks_name, preload = False):
         # cl = clock.start()
 
-        if blocks_name != None:
-            self.loaded_blocks[model_id] = blocks_name           
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         
@@ -1019,26 +1087,50 @@ class offload:
                     #     else:
                     #         p.data.record_stream(record_for_stream)
 
+        any_past_block = False
+
+        loaded_block = self.loaded_blocks[model_id]
+        if not preload and loaded_block != None:
+            any_past_block = True
+            self.gpu_unload_blocks(model_id, loaded_block)
+            if self.ready_to_check_mem():
+                self.empty_cache_if_needed()
+
 
         if self.verboseLevel >=2:
             model = self.models[model_id]
             model_name = model._get_name()
-            print(f"Loading model {entry_name} ({model_name}) in GPU")
- 
+            # if not preload:
+            #     print(f"Request to load model {entry_name} ({model_name}) in GPU")
+                
 
         if self.async_transfers and blocks_name != None:
-            first = self.prev_blocks_names[entry_name] == None
+            first = self.prev_blocks_names[entry_name] == None or not any_past_block
             next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
             if first:
                 cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
+                if self.verboseLevel >=2:
+                    if preload:
+                        print(f"Preloading model {entry_name} ({model_name}) in GPU")
+                    else:
+                        print(f"Loading model {entry_name} ({model_name}) in GPU")
+
             torch.cuda.synchronize()
 
             if next_blocks_entry != None:
                 cpu_to_gpu(self.transfer_stream, self.blocks_of_modules[next_blocks_entry]) #, self.default_stream
+                if self.verboseLevel >=2:
+                    print(f"Prefetching model {next_blocks_entry} ({model_name}) in GPU")
 
         else:
             cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
+            if self.verboseLevel >=2:
+                print(f"Loading model {entry_name} ({model_name}) in GPU")
             torch.cuda.synchronize()
+
+        if not preload:
+            self.loaded_blocks[model_id] = blocks_name           
+
         # cl.stop()
         # print(f"load time: {cl.format_time_gap()}")
 
@@ -1072,13 +1164,19 @@ class offload:
         self.active_models.append(model)
         self.active_models_ids.append(model_id)
 
-        self.gpu_load_blocks(model_id, None)
+        self.gpu_load_blocks(model_id, None, True)
+        for block_name in self.preloaded_blocks_per_model[model_id]:
+            self.gpu_load_blocks(model_id, block_name, True)
+
 
         # torch.cuda.current_stream().synchronize()    
 
     def unload_all(self):
         for model_id in self.active_models_ids:
             self.gpu_unload_blocks(model_id, None)      
+            for block_name in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_unload_blocks(model_id, block_name)
+
             loaded_block = self.loaded_blocks[model_id]
             if loaded_block != None:
                 self.gpu_unload_blocks(model_id, loaded_block)      
@@ -1152,19 +1250,10 @@ class offload:
 
         # @torch.compiler.disable()
         def preload_blocks_for_compile(module,  *args, **kwargs):
-            some_context = context #for debugging
-            if blocks_name == None:
-                if self.ready_to_check_mem():
-                    self.empty_cache_if_needed()
-            else:                
-                loaded_block = self.loaded_blocks[model_id]
-                if (loaded_block == None or loaded_block != blocks_name) :
-                    if loaded_block != None:
-                        self.gpu_unload_blocks(model_id, loaded_block)
-                        if self.ready_to_check_mem():
-                            self.empty_cache_if_needed()
-                    self.loaded_blocks[model_id] = blocks_name
-                    self.gpu_load_blocks(model_id, blocks_name)
+            # some_context = context #for debugging
+            if blocks_name != None and blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_load_blocks(model_id, blocks_name)
+
         # need to be registered before the forward not to be break the efficiency of the compilation chain
         # it should be at the top of the compilation as this type of hook in the middle of a chain seems to break memory performance
         target_module.register_forward_pre_hook(preload_blocks_for_compile)        
@@ -1179,18 +1268,12 @@ class offload:
         def check_empty_cuda_cache(module, *args, **kwargs):
             # if self.ready_to_check_mem():
             #     self.empty_cache_if_needed()
+
             if blocks_name == None:
                 if self.ready_to_check_mem():
                     self.empty_cache_if_needed()
-            else:                
-                loaded_block = self.loaded_blocks[model_id]
-                if (loaded_block == None or loaded_block != blocks_name) :
-                    if loaded_block != None:
-                        self.gpu_unload_blocks(model_id, loaded_block)
-                        if self.ready_to_check_mem():
-                            self.empty_cache_if_needed()
-                    self.loaded_blocks[model_id] = blocks_name
-                    self.gpu_load_blocks(model_id, blocks_name)
+            elif blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
+                self.gpu_load_blocks(model_id, blocks_name)
             if qint4quantization:
                 args, kwargs = self.move_args_to_gpu(*args, **kwargs)
 
@@ -1240,69 +1323,82 @@ class offload:
             print(f"Hooked to model '{model_id}' ({model_name})")
 
 
-def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
-    """save the weights of a model and quantize them if requested
-    These weights can be loaded again using 'load_model_data'
-    """       
-    
-    config = None
-    verboseLevel = _compute_verbose_level(verboseLevel)
-    if config_file_path !=None:
-        with open(config_file_path, "r", encoding="utf-8") as reader:
-            text = reader.read()
-            config= json.loads(text)
-    elif hasattr(model, "_config"):
-        config = model._config
-    elif hasattr(model, "config"):
-        config_fullpath = None
-        config_obj = getattr(model,"config")
-        config_path = getattr(config_obj,"_name_or_path", None)
-        if config_path != None:
-            config_fullpath = os.path.join(config_path, "config.json")      
-            if not os.path.isfile(config_fullpath):
-                config_fullpath = None
-        if config_fullpath is None:                            
-            config_fullpath =  os.path.join(os.path.dirname(file_path), "config.json")
-        if os.path.isfile(config_fullpath):
-            with open(config_fullpath, "r", encoding="utf-8") as reader:
-                text = reader.read()
-                config= json.loads(text)
 
-    if do_quantize:
-        _quantize(model, weights=quantizationType, model_id=file_path)
-    
-    quantization_map = getattr(model, "_quanto_map", None)
+    def tune_preloading(self, model_id, current_budget, towers_names):
+        preloaded_blocks = {}
+        preload_total = 0
+        max_blocks_fetch = 0
 
-    if verboseLevel >=1:
-        print(f"Saving file '{file_path}")
-    safetensors2.torch_write_file(model.state_dict(),  file_path , quantization_map = quantization_map, config = config)
-    if verboseLevel >=1:
-        print(f"File '{file_path}' saved")
+        self.preloaded_blocks_per_model[model_id] = preloaded_blocks
+
+        if current_budget == 0 or towers_names is None or len(towers_names) == 0 or not self.async_transfers:
+            return
+        # current_budget = 5000 * ONE_MB
+        base_size = self.blocks_of_modules_sizes[model_id] 
+        current_budget -= base_size
+        if current_budget <= 0:
+            return
+        
+        towers = []
+        total_size = 0
+        for tower_name in towers_names:
+            max_floor_size = 0
+            tower_size = 0
+            floors = []
+            prefix = model_id + "/" + tower_name
+            for name, size in self.blocks_of_modules_sizes.items():
+                if name.startswith(prefix):
+                    tower_size += size
+                    floor_no = int(  name[len(prefix): ] )
+                    floors.append( (name, floor_no, size))
+                    max_floor_size = max(max_floor_size, size)
+
+            towers.append( (floors, max_floor_size, tower_size) )
+            total_size += tower_size
+            current_budget -=  2 * max_floor_size
+            if current_budget <= 0:
+                return
 
 
-def extract_models(prefix, obj):
-    pipe = {}
-    for name in dir(obj):            
-        element = getattr(obj,name)
-        if name  in ("pipeline", "pipe"):
-            pipeline = element
-            if  hasattr(pipeline , "components") and isinstance(pipeline.components, dict):
-                for k, model in pipeline.components.items():
-                    if model != None:
-                        pipe[prefix  + "/" + k ] = model
-        elif isinstance(element, torch.nn.Module): 
-            if prefix  + "/" + name in pipe:
-                pipe[prefix  + "/_" + name ] = element
+        for floors, max_floor_size, tower_size in towers:
+            tower_budget = tower_size / total_size * current_budget
+            preload_blocks_count = int( tower_budget / max_floor_size)
+            preload_total += preload_blocks_count * max_floor_size
+            max_blocks_fetch = max(max_floor_size, max_blocks_fetch)
+            if preload_blocks_count  <= 0:
+                return 
+            
+            nb_blocks= len(floors)
+            space_between =  (nb_blocks - preload_blocks_count) / preload_blocks_count 
+            cursor = space_between
+            first_non_preloaded = None
+            prev_non_preloaded = None
+            for block in floors:
+                name, i, size = block
+                if i < cursor:
+                    if prev_non_preloaded == None:
+                        first_non_preloaded = name
+                    else:
+                        self.next_blocks_names[prev_non_preloaded] = name
+                        self.prev_blocks_names[name] = prev_non_preloaded
+                    prev_non_preloaded = name
+                else:
+                    self.next_blocks_names[name] = None
+                    self.prev_blocks_names[name] = None
+                    preloaded_blocks[name[ len(model_id) + 1 : ] ] = size
+                    cursor += 1 + space_between
+
+            if prev_non_preloaded != None and len(towers) == 1 : 
+                self.next_blocks_names[prev_non_preloaded] = first_non_preloaded
+                self.prev_blocks_names[first_non_preloaded] = prev_non_preloaded
             else:
-                pipe[prefix  + "/" + name ] = element
-        elif isinstance(element, dict):
-            for k, element in element.items():
-                if  hasattr(element , "pipeline"):
-                    pipe.update( extract_models(prefix + "/" + k,element ))
+                self.next_blocks_names[prev_non_preloaded] = None
 
+        self.preloaded_blocks_per_model[model_id] = preloaded_blocks
 
-    return pipe
-    
+        if self.verboseLevel >=2:
+            print(f"Async loading plan for model '{model_id}' : {preload_total/ONE_MB:0.2f} MB will be preloaded ({preload_total/total_size*100:0.1f}% of recurrent layers data) with a {max_blocks_fetch/ONE_MB:0.2f} MB async shuttle")
+
 
 def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
@@ -1382,8 +1478,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
 
     self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
     if self.anyCompiledModule:
-        torch._dynamo.config.cache_size_limit = 10000
         torch.compiler.reset()
+        torch._dynamo.config.cache_size_limit = 10000
+    #dynamic=True
 
       #  torch._logging.set_logs(recompiles=True)
       #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
@@ -1463,7 +1560,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
         if compilationInThisOne:
             if self.verboseLevel>=1:
                 if len(towers_modules)>0:
-                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {towers_names}*.")
+                    formated_tower_names = [name + '*' for name in towers_names]
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
                 else:
                     print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
 
@@ -1479,7 +1577,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                 _pin_to_memory(current_model, model_id, partialPinning= partialPinning, verboseLevel=verboseLevel)            
 
         current_budget = model_budgets[model_id]
-        current_size = 0
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq = None, None, None, -1
         self.loaded_blocks[model_id] = None
 
@@ -1489,10 +1586,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
             if  not hasattr(submodule, "_hf_hook"):
                 setattr(submodule, "_hf_hook", HfHook())
 
-            # if submodule_name=='':
-            #     continue
-
-
             if current_budget > 0 and len(submodule_name) > 0:
                 if cur_blocks_prefix != None:
                     if submodule_name.startswith(cur_blocks_prefix):
@@ -1500,7 +1593,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                         depth_name = submodule_name.split(".")
                         level  =  depth_name[len(depth_prefix)-1]                        
                         pre , num = _extract_num_from_str(level)
-                        if num != cur_blocks_seq and (cur_blocks_seq == -1 or current_size > current_budget): 
+                        if num != cur_blocks_seq: #and (cur_blocks_seq == -1 or current_size > current_budget) 
                             prev_blocks_name = cur_blocks_name
                             cur_blocks_name =  cur_blocks_prefix + str(num)
                             # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
@@ -1528,13 +1621,34 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = Tru
                     else:
                         self.hook_check_empty_cache_needed(submodule, model_id, cur_blocks_name, submodule_method, context = submodule_name )
 
-                current_size = self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
+                self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name)
+
+        self.tune_preloading(model_id, current_budget, towers_names)
 
 
     if self.verboseLevel >=2:
-        for n,b in self.blocks_of_modules_sizes.items():
-            print(f"Size of submodel '{n}': {b/ONE_MB:.1f} MB")
+        start_num, prev_num, prev_pre, prev_size  = -1, -1, None, -1
+         
+        def print_size_range(n,start_num,prev_num, prev_size ):
+            if prev_num < 0:
+                print(f"Size of submodel '{n}': {prev_size/ONE_MB:.1f} MB")
+            elif prev_num - start_num <=1:
+                print(f"Size of submodel '{n+ str(start_num)}': {prev_size/ONE_MB:.1f} MB")
+            else:
+                print(f"Size of submodel '{n+ str(start_num) +'-'+ str(prev_num)}': {prev_size/ONE_MB:.1f} MB")
 
+        for n, size in self.blocks_of_modules_sizes.items():
+            pre, num = _extract_num_from_str(n) if "/" in n else (n, -1)
+            if prev_pre == None :
+                start_num = num
+            elif prev_pre != pre or prev_pre == pre and size != prev_size:
+                print_size_range(prev_pre,start_num,prev_num, prev_size )
+                start_num = num
+            prev_num, prev_pre, prev_size = num, pre, size
+        if prev_pre != None:
+            print_size_range(prev_pre,start_num,prev_num, prev_size )
+
+  
     torch.set_default_device('cuda')
     torch.cuda.empty_cache()
     gc.collect()         
