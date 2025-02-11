@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.1.4-15 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.1.4-151 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -73,7 +73,7 @@ You can choose between 5 profiles depending on your hardware:
 - LowRAM_LowVRAM  (4): at least 32 GB of RAM and 12 GB of VRAM :  if you have little VRAM or want to generate longer videos / more images
 - VerylowRAM_LowVRAM  (5): at least 24 GB of RAM and 10 GB of VRAM : if you don't have much it won't be fast but maybe it will work
 
-Profile 2 (High RAM) and 4 (Low RAM)are the most recommended profiles since they are versatile (support for long videos for a slight performance cost).\
+Profile 2 (High RAM) and 4 (Low RAM) are the most recommended profiles since they are versatile (support for long videos for a slight performance cost).\
 If you use Flux derived applciation profile 1 and 3 will offer much faster generation times.
 In any case, a safe approach is to start from profile 5 (default profile) and then go down progressively to profile 4 and then to profile 2 as long as the app remains responsive or doesn't trigger any out of memory error.
 
@@ -99,11 +99,13 @@ For example:
 - pinnedMemory: Boolean (for all models) or List of models ids to pin to RAM. Every model pinned to RAM will load much faster (up to 2 times) but this requires more RAM
 - quantizeTransformer: boolean by default True. The 'transformer' model in the pipe contains usually the video or image generator is by defaut; quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. If you don't want to quantize the image generator, you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 - extraModelsToQuantize: list of additional modelids of models to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
-- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in  VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. 
+- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in  VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. To define the default value in the dictionary, you may add entry named "*".
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
+- workingVRAM: either a number in mega bytes or a dictionary that maps a model ids to a number in mega bytes that corresponds to a minimum amount of VRAM that should be left for the data processed by the model. This number will prevail if it is in conflict with a too high budget defined for the same model.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
 - compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. It makes sense to compile only the model that is frequently used such as the "transformer" model in the case of video or image generation. Compilation requires Triton to be installed. Triton is available out of the box on Linux or WSL but requires to be installed with Windows: https://github.com/woct0rdho/triton-windows
+- coTenantsMap: a dictionary that maps a model id to a list of other models with which it accepts to share the VRAM at the same time. This is useful to avoid unefficient loading / unloading when two models processes are interleaved. For instance *coTenantsMap = { "text_encoder_2": ["text_encoder"] }* , here when *text_encoder_2* is loaded it won't unload *text_encoder*. Please note that the reverse is not true as these maps by design are not symetrical to allow tailored workflows. If you need to have as well *text_encoder* that won't unload *text_encoder_2* if it is already loaded *coTenantsMap = { "text_encoder_2": ["text_encoder"], "text_encoder": ["text_encoder_2"] }*
 
 If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models direclty rather than using on the fly quantization, it will be faster and consume slightly less RAM.
  
@@ -113,9 +115,12 @@ The module includes several tools to package a light version of your favorite vi
 - *extract_models(string prefix,  obj to explore)*\
 This tool will try to detect for you models that are embedded in a pipeline or in some custom class. It will save you time by building a pipe dictionary required by *offload.all* or "offload.profile*. The prefix correponds to the text that will appear before the name of each model in the dictionary.
 
-- *load_loras_into_model(model, lora_path, lora_multi)*\
+- *load_loras_into_model(model, lora_path, lora_multi, activate_all_loras = True)*\
 Load in a model a list of Lora described by a list of path *lora_path* and a list of *weights coefficients*.
-The Lora file must be in the *diffusers* format. This function works also on non diffusers models. However if there is already an official Lora support for a model it is recommended to use the official diffusers functions.
+The Lora file must be in the *diffusers* format. This function works also on non diffusers models. However if there is already an official Lora support for a model it is recommended to use the official diffusers functions. By default all the load loras will be activated or they can be activated later using *activate_loras*.
+
+-*activate_loras(model, lora_nos, lora_multi = None )*\
+Activate the loras whose nos are in the list of nos. Every lora that is not this list and that was activated previously will be disactivated.
 
 - *save_model(model, file_path, do_quantize = False, quantizationType = qint8 )*\
 Save tensors of a model already loaded in memory in a safetensor format (much faster to reload). You can save it in a quantized format (default qint8 quantization recommended).

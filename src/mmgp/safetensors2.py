@@ -146,7 +146,7 @@ def _read_safetensors_header(path, file):
     return catalog, metadata, length_of_header + 8
 
     
-def torch_write_file(sd, file_path, quantization_map = None, config = None):
+def torch_write_file(sd, file_path, quantization_map = None, config = None, extra_meta = None):
     from collections import OrderedDict
     sf_sd = OrderedDict()
  
@@ -188,6 +188,14 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None):
 
     if not config is None:
         metadata["config_base64"] = base64.b64encode(json.dumps(config, ensure_ascii=False).encode('utf8')).decode('utf8')
+
+    if not extra_meta is None:
+        for n , m in extra_meta.items():
+            if isinstance(m, str):
+                metadata[n] = m
+            else:
+                metadata[n + "_base64"] = base64.b64encode(json.dumps(m, ensure_ascii=False).encode('utf8')).decode('utf8')
+
 
     if len(metadata) > 0:
         sf_sd["__metadata__"] = metadata
@@ -444,5 +452,3 @@ try:
     transformers.modeling_utils.safe_load_file = torch_load_file
 except:
     pass
-
-
