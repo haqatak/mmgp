@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.1.4-1519 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.1.4-15926 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -457,7 +457,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1.4-151) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1.4-15192) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
@@ -728,15 +728,20 @@ def _lora_linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor
                     continue
                 if self.use_dora[active_adapter]:
                     raise Exception("Dora not yet supported by mmgp")
+
                 lora_A = self.lora_A[active_adapter]
                 lora_B = self.lora_B[active_adapter]
+                dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 lora_A_weight = lora_A.weight
                 lora_B_weight = lora_B.weight
                 lora_BA = lora_B_weight @ lora_A_weight   
                 base_weight += scaling * lora_BA
 
-            result = torch.nn.functional.linear(x, base_weight, bias=self.base_layer.bias)
+            if self.training:
+                result = torch.nn.functional.linear(dropout(x), base_weight, bias=self.base_layer.bias)
+            else:
+                result = torch.nn.functional.linear(x, base_weight, bias=self.base_layer.bias)
             torch_result_dtype = result.dtype
 
         else:
@@ -754,14 +759,18 @@ def _lora_linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor
                 x = x.to(lora_A.weight.dtype)
 
                 if not self.use_dora[active_adapter]:
-                    y = lora_A(x)
+                    if self.training:                        
+                        y = lora_A(dropout(x))
+                    else:
+                        y = lora_A(x)
+
                     y = lora_B(y)
                     y*= scaling
                     result+= y 
                     del lora_A, lora_B, y
                     # result = result + lora_B(lora_A(dropout(x))) * scaling
                 else:
-                    if isinstance(dropout, nn.Identity) or not self.training:
+                    if isinstance(dropout, torch.nn.Identity) or not self.training:
                         base_result = result
                     else:
                         x = dropout(x)
@@ -1612,6 +1621,31 @@ class offload:
         if self.verboseLevel >=1:
             print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {preload_total/total_size*100:0.1f}% of recurrent layers data) with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + " shuttle")
 
+    def release(self):
+        global last_offload_obj
+
+        if last_offload_obj == self:
+            last_offload_obj = None
+
+        self.unload_all()
+        self.default_stream = None
+        keys= [k for k in self.blocks_of_modules.keys()]
+        for k in keys:
+            del self.blocks_of_modules[k]
+
+        self.blocks_of_modules = None
+
+
+        for model_id, model in self.models.items():
+            move_loras_to_device(model, "cpu")
+
+        self.models = None            
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+
 
 def all(pipe_or_dict_of_modules, pinnedMemory = False, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
@@ -1893,12 +1927,11 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     """Apply a configuration profile that depends on your hardware:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     profile_name : num of the profile:
-        HighRAM_HighVRAM_Fastest (=1): at least 48 GB of RAM and 24 GB of VRAM : the fastest well suited for a RTX 3090 / RTX 4090
-        HighRAM_LowVRAM_Fast (=2): at least 48 GB of RAM and 12 GB of VRAM : a bit slower, better suited for RTX 3070/3080/4070/4080 
-            or for RTX 3090 / RTX 4090 with large pictures batches or long videos
-        LowRAM_HighVRAM_Medium (=3): at least 32 GB of RAM and 24 GB of VRAM : so so speed but adapted for RTX 3090 / RTX 4090 with limited RAM
-        LowRAM_LowVRAM_Slow (=4): at least 32 GB of RAM and 12 GB of VRAM : if have little VRAM or generate longer videos 
-        VerylowRAM_LowVRAM_Slowest (=5): at least 24 GB of RAM and 10 GB of VRAM : if you don't have much it won't be fast but maybe it will work            
+        HighRAM_HighVRAM_Fastest (=1): will try to load entirely a model  in VRAM and to keep a copy in reserved RAM for fast loading / unloading
+        HighRAM_LowVRAM_Fast (=2): will try to load only the needed parts of a model in VRAM and to keep a copy in reserved RAM for fast loading / unloading
+        LowRAM_HighVRAM_Medium (=3): will try to load entirely a model  in VRAM and to keep a copy in reserved RAM for fast loading / unloading, 8 bits quantization of main model
+        LowRAM_LowVRAM_Slow (=4): will try to load only the needed parts of a model in VRAM and to keep a copy in reserved RAM for fast loading / unloading, 8 bits quantization of main models
+        VerylowRAM_LowVRAM_Slowest (=5): will try to load only the needed parts of a model in VRAM, 8 bits quantization of main models
     overrideKwargs: every parameter accepted by Offload.All can be added here to override the profile choice
         For instance set quantizeTransformer = False to disable transformer quantization which is by default in every profile
     """      
@@ -1942,21 +1975,21 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     if profile_no == profile_type.HighRAM_HighVRAM:
         pinnedMemory= True
         budgets = None
-        info = "You have chosen a profile that may require 48 GB of RAM and up to 24 GB of VRAM on some applications."
+        # info = "You have chosen a profile that may require 48 GB of RAM and up to 24 GB of VRAM on some applications."
     elif profile_no == profile_type.HighRAM_LowVRAM:
         pinnedMemory= True
         budgets["*"] =  3000
-        info = "You have chosen a profile that may require 48 GB of RAM and up to 12 GB of VRAM on some applications."
+        # info = "You have chosen a profile that may require 48 GB of RAM and up to 12 GB of VRAM on some applications."
     elif profile_no == profile_type.LowRAM_HighVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets = None
-        info = "You have chosen a Medium speed profile that may require 32 GB of RAM and up to 24 GB of VRAM on some applications."
+        # info = "You have chosen a Medium speed profile that may require 32 GB of RAM and up to 24 GB of VRAM on some applications."
     elif profile_no == profile_type.LowRAM_LowVRAM:
         pinnedMemory= "transformer"
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets["*"] =  3000
-        info = "You have chosen a profile that usually may require 32 GB of RAM and up to 12 GB of VRAM on some applications."
+        # info = "You have chosen a profile that usually may require 32 GB of RAM and up to 12 GB of VRAM on some applications."
     elif profile_no == profile_type.VerylowRAM_LowVRAM:
         pinnedMemory= False
         extraModelsToQuantize = default_extraModelsToQuantize
@@ -1964,11 +1997,11 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         if "transformer" in modules:
             budgets["transformer"] = 400    
         #asyncTransfers = False
-        info = "You have chosen the slowest profile that may require 24 GB of RAM and up to 10 GB of VRAM on some applications."
+        # info = "You have chosen the slowest profile that may require 24 GB of RAM and up to 10 GB of VRAM on some applications."
     else:
         raise Exception("Unknown profile")
-    info += " Actual requirements may varry depending on the application or on the tuning done to the profile."
-    
+    # info += " Actual requirements may varry depending on the application or on the tuning done to the profile."
+    info =""    
     if budgets != None and len(budgets) == 0:
         budgets = None
 
@@ -1976,7 +2009,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     kwargs = { "pinnedMemory": pinnedMemory,  "extraModelsToQuantize" : extraModelsToQuantize, "budgets": budgets, "asyncTransfers" : asyncTransfers, "quantizeTransformer": quantizeTransformer   }
 
     if verboseLevel>=2:
-        info = info + CrLf + f"Profile '{profile_type.tostr(profile_no)}' sets the following options:" 
+        info = info  + f"Profile '{profile_type.tostr(profile_no)}' sets the following options:" #CrLf 
         for k,v in kwargs.items():
             if k in overrideKwargs: 
                 info = info + CrLf + f"- '{k}':  '{kwargs[k]}' overriden with value '{overrideKwargs[k]}'"
