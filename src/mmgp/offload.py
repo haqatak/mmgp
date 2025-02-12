@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.1.4-15926 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.1.4-159265 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -457,7 +457,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1.4-15192) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.1.4-1592653) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
