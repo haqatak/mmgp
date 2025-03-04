@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.2.0 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.2.2 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -27,6 +27,9 @@ Each profile may use a combination of the following:
 
 ## Sample applications that use mmgp
 It is recommended to have a look at these applications to see how mmgp was implemented in each of them:
+- Wan2GP: https://github.com/deepbeepmeep/Wan2GP :\
+An excellent text to video and image to video generator by Alibaba
+
 - Hunyuan3D-2GP: https://github.com/deepbeepmeep/Hunyuan3D-2GP :\
 A great image to 3D and text to 3D tool by the Tencent team. Thanks to mmgp it can run with less than 6 GB of VRAM
 
@@ -99,9 +102,9 @@ For example:
 - pinnedMemory: Boolean (for all models) or List of models ids to pin to RAM. Every model pinned to RAM will load much faster (up to 2 times) but this requires more RAM
 - quantizeTransformer: boolean by default True. The 'transformer' model in the pipe contains usually the video or image generator is by defaut; quantized on the fly by default to 8 bits. If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. If you don't want to quantize the image generator, you need to set the option *quantizeTransformer* to *False* to turn off on the fly quantization.
 - extraModelsToQuantize: list of additional modelids of models to quantize on the fly. If the corresponding model is already quantized, this option will be ignored.
-- budgets: either a number in mega bytes (for all models, if 0 unlimited budget) or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in  VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. To define the default value in the dictionary, you may add entry named "*".
+- budgets: either a number in mega bytes,  (for all models, if 0 unlimited budget) a string that is perecentage of the total VRAM or a dictionary that maps model ids to mega bytes : define the approximate budget in mega bytes that is allocated in  VRAM for a model. Try not to allocate all the available VRAM so that the rest can be used to process the data. To define the default value in the dictionary, you may add entry named "*".
 The smaller this number, the more VRAM left for image data / longer video but also the slower because there will be lots of loading / unloading between the RAM and the VRAM. If model is too big to fit in a budget, it will be broken down in multiples parts that will be unloaded / loaded consequently. The speed of low budget can be  increased (up to 2 times) by turning on the options pinnedMemory and asyncTransfers.
-- workingVRAM: either a number in mega bytes or a dictionary that maps a model ids to a number in mega bytes that corresponds to a minimum amount of VRAM that should be left for the data processed by the model. This number will prevail if it is in conflict with a too high budget defined for the same model.
+- workingVRAM: either a number in mega bytes, a string that is perecentage of the total VRAM or a dictionary that maps a model ids to a number in mega bytes that corresponds to a minimum amount of VRAM that should be left for the data processed by the model. This number will prevail if it is in conflict with a too high budget defined for the same model.
 - asyncTransfers: boolean, load to the GPU the next model part while the current part is being processed. This requires twice the budget if any is defined. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - verboseLevel: number between 0 and 2 (1 by default), provides various level of feedback of the different processes
 - compile: list of model ids to compile, may accelerate up x2 depending on the type of GPU. It makes sense to compile only the model that is frequently used such as the "transformer" model in the case of video or image generation. Compilation requires Triton to be installed. Triton is available out of the box on Linux or WSL but requires to be installed with Windows: https://github.com/woct0rdho/triton-windows

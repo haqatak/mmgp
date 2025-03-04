@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.2.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.2.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -479,7 +479,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.2.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.2.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
@@ -603,8 +603,6 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
     tied_weights= {}
 
     for submodule_name, submodule in model_to_quantize.named_modules():  
-        if "embed_token" in submodule_name:
-            pass
         if isinstance(submodule, QModuleMixin):
             if verboseLevel>=1:
                 print("No quantization to do as model is already quantized")
@@ -802,7 +800,7 @@ def _lora_linear_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor
                 scaling = get_scaling(active_adapter)
                 lora_A_weight = lora_A.weight
                 lora_B_weight = lora_B.weight
-                if new_weights: 
+                if new_weights:  
                     base_weight = torch.addmm(base_weight, lora_B_weight, lora_A_weight, alpha= scaling )
                     # base_weight = base_weight + scaling * lora_B_weight @ lora_A_weight
                 else:
@@ -1017,7 +1015,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, verboseLevel = -1):
+def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, modelClass=None, verboseLevel = -1):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1031,6 +1029,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         raise Exception("full model path to file expected")
 
     model_path = _get_model(model_path)
+    
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     with safetensors2.safe_open(model_path) as f:
@@ -1058,11 +1057,13 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
     if "architectures" in transformer_config: 
         architectures = transformer_config["architectures"]
         class_name = architectures[0] 
-
-        module = __import__("transformers")
-        map = {  "T5WithLMHeadModel" : "T5EncoderModel"}
-        class_name = map.get(class_name, class_name)
-        transfomer_class = getattr(module, class_name)
+        if modelClass !=None:
+            transfomer_class = modelClass
+        else:
+            module = __import__("transformers")
+            map = {  "T5WithLMHeadModel" : "T5EncoderModel"}
+            class_name = map.get(class_name, class_name)
+            transfomer_class = getattr(module, class_name)
         from transformers import AutoConfig
 
         import tempfile
@@ -1081,8 +1082,11 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
     elif "_class_name" in transformer_config:
         class_name = transformer_config["_class_name"]
 
-        module = __import__("diffusers")
-        transfomer_class = getattr(module, class_name)
+        if modelClass !=None:
+            transfomer_class = modelClass
+        else:
+            module = __import__("diffusers")
+            transfomer_class = getattr(module, class_name)
 
         with init_empty_weights():
             model = transfomer_class.from_config(transformer_config)
@@ -1104,6 +1108,8 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
     """
 
     file_path = _get_model(file_path)
+    if file_path == None:
+        raise Exception("Unable to find file")
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     model = _remove_model_wrapper(model)
@@ -1153,9 +1159,16 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             _requantize(model, state_dict, quantization_map)    
 
     missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
-    if len(missing_keys) > 0 and hasattr(model, "base_model_prefix"):
+    if len(missing_keys) > 0 :
         # if there is a key mismatch maybe we forgot to remove some prefix or we are trying to load just a sub part of a larger model
-        base_model_prefix = model.base_model_prefix + "."
+        if hasattr(model, "base_model_prefix"):
+            base_model_prefix = model.base_model_prefix + "."
+        else:
+            for k,v in state_dict.items():
+                if k.endswith(missing_keys[0]):
+                    base_model_prefix = k[:-len(missing_keys[0])]
+                    break
+
         new_state_dict= {}
         start = -1
         for k,v in state_dict.items():
@@ -1521,7 +1534,6 @@ class offload:
         model = self.models[model_id]
         self.active_models.append(model)
         self.active_models_ids.append(model_id)
-
         self.gpu_load_blocks(model_id, None, True)
         for block_name in self.preloaded_blocks_per_model[model_id]:
             self.gpu_load_blocks(model_id, block_name, True)
