@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.2.2 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.2.8 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 

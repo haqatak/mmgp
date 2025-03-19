@@ -1,6 +1,6 @@
 [project]
 name = "mmgp"
-version = "3.2.2"
+version = "3.2.8"
 authors = [
   { name = "deepbeepmeep", email = "deepbeepmeep@yahoo.com" },
 ]
@@ -13,7 +13,6 @@ dependencies = [
   "optimum-quanto",
   "accelerate",
   "safetensors",
-  "psutil",
-  "peft"
+  "psutil"
 ]
 
