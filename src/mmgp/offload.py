@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.2.8 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.3.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -92,6 +92,8 @@ ONE_MB =  1048576
 sizeofbfloat16 = torch.bfloat16.itemsize
 sizeofint8 = torch.int8.itemsize
 total_pinned_bytes = 0
+max_pinnable_bytes = 0
+
 physical_memory= psutil.virtual_memory().total
 
 HEADER = '\033[95m'
@@ -319,6 +321,13 @@ def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
             print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
 
 def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
+    global max_pinnable_bytes, total_pinned_bytes
+    if max_pinnable_bytes > 0 and  max_pinnable_bytes >= max_pinnable_bytes:
+
+        if  verboseLevel>=1 :
+            print(f"Unable pin data of '{sd_name}' to reserved RAM as there is no reserved RAM left")
+        return
+
     current_big_tensor_size = 0
     big_tensor_no  = 0
     big_tensors_sizes = []
@@ -393,8 +402,17 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
 
 
 def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
+
+    global max_pinnable_bytes, total_pinned_bytes
+    if max_pinnable_bytes > 0 and  max_pinnable_bytes >= max_pinnable_bytes:
+
+        if  verboseLevel>=1 :
+            print(f"Unable pin data of '{model_id}' to reserved RAM as there is no reserved RAM left")
+        return
+    
     if partialPinning:
         towers_names, _ = _detect_main_towers(model)
+
 
 
     current_big_tensor_size = 0
@@ -484,13 +502,18 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     total = 0
     
 
+    failed_planned_allocation = False
 
     for size in big_tensors_sizes:
         try:
+            # if total > 7000 * ONE_MB:
+            #     raise  Exception ("test no more reserved RAM")
             current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
             big_tensors.append(current_big_tensor)
         except:
             print(f"Unable to pin more tensors for this model as the maximum reservable memory has been reached ({total/ONE_MB:.2f})")
+            max_pinnable_bytes = total + total_pinned_bytes
+            failed_planned_allocation = True
             break
 
         last_big_tensor += 1
@@ -553,13 +576,13 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                     p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
             tensor_no += 1
         del p
-    global total_pinned_bytes
+    model._pinned_bytes = total
     total_pinned_bytes += total
     del params_dict
     gc.collect()
 
     if verboseLevel >=1:
-        if partialPinning:        
+        if partialPinning or failed_planned_allocation:        
             print(f"The model was partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
         else:
             print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
@@ -575,7 +598,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.2.8) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.3.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
@@ -882,10 +905,11 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             return source + CrLf + text
     
     def trunc(text, sz):
+        text = str(text)
         if len(text) < sz:
-            return str(text)
+            return text
         else:
-            return str(text)[0:sz] + '...'
+            return text[0:sz] + '...'
 
     if not isinstance(lora_path, list):
         lora_path = [lora_path]
@@ -1408,7 +1432,9 @@ def extract_models(obj = None, prefix = None):
     elif prefix[ -1:] != "/":
         prefix  + "/"        
     
-    for name in dir(obj):            
+    for name in dir(obj):
+        if name in ["_execution_device"]:
+            continue            
         element = getattr(obj,name)
         if name  in ("pipeline", "pipe"):
             pipeline = element
@@ -1550,7 +1576,7 @@ class offload:
                 lora_A, lora_B, alpha = lora_data
                 key = adapter + '_GPU'
                 if to_GPU:
-                    lora_module[key] = [lora_A.cuda(), lora_B.cuda(), alpha]
+                    lora_module[key] = [lora_A.cuda(non_blocking=True), lora_B.cuda(non_blocking=True), alpha]
                 elif key in lora_module:
                     del lora_module[key]
             
@@ -1594,8 +1620,8 @@ class offload:
                         lora_data =  loras_model_data.get(parent_module, None)
                         if lora_data != None:
                             loras_modules[parent_module]= lora_data
-            if len(loras_modules) > 0:
-                self._move_loras(loras_active_adapters, loras_modules, True)
+                if len(loras_modules) > 0:
+                    self._move_loras(loras_active_adapters, loras_modules, True)
 
         loaded_block = self.loaded_blocks[model_id]
 
@@ -2019,7 +2045,7 @@ class offload:
             print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {preload_total/total_size*100:0.1f}% of recurrent layers data) with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + " shuttle")
 
     def release(self):
-        global last_offload_obj
+        global last_offload_obj, total_pinned_bytes
 
         if last_offload_obj == self:
             last_offload_obj = None
@@ -2035,6 +2061,8 @@ class offload:
 
         for model_id, model in self.models.items():
             move_loras_to_device(model, "cpu")
+            if hasattr(model, "_pinned_bytes"):
+                total_pinned_bytes -= model._pinned_bytes
             if hasattr(model, "_loras_model_data"):
                 unload_loras_from_model(model)
 
@@ -2046,7 +2074,7 @@ class offload:
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -2216,9 +2244,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, l
         
         model_budgets[model_id] = model_budget
 
-    partialPinning = False
 
-    if estimatesBytesToPin > 0 and estimatesBytesToPin >= (max_reservable_memory - total_pinned_bytes):
+    if not partialPinning and estimatesBytesToPin > 0 and estimatesBytesToPin >= (max_reservable_memory - total_pinned_bytes):
         if self.verboseLevel >=1:
             print(f"Switching to partial pinning since full requirements for pinned models is {estimatesBytesToPin/ONE_MB:0.1f} MB while estimated available reservable RAM is {(max_reservable_memory-total_pinned_bytes)/ONE_MB:0.1f} MB. You may increase the value of parameter 'perc_reserved_mem_max' to a value higher than {perc_reserved_mem_max:0.2f} to force full pinnning." )
         partialPinning = True
