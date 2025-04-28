@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.3.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.4.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -89,7 +89,7 @@ mmm = safetensors2.mmm
 default_verboseLevel = 1
 
 ONE_MB =  1048576
-sizeofbfloat16 = torch.bfloat16.itemsize
+sizeofhalffloat = torch.bfloat16.itemsize
 sizeofint8 = torch.int8.itemsize
 total_pinned_bytes = 0
 max_pinnable_bytes = 0
@@ -149,10 +149,17 @@ def _compute_verbose_level(level):
     safetensors2.verboseLevel = level
     return level
 
-def _get_perc_reserved_mem_max(perc_reserved_mem_max):
-    if perc_reserved_mem_max<=0:             
+def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
+    if perc_reserved_mem_max <=0:
+        perc_reserved_mem_max = os.getenv("perc_reserved_mem_max", 0)
+
+    if perc_reserved_mem_max <= 0:             
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
-    return  perc_reserved_mem_max 
+    return perc_reserved_mem_max
+    
+def _get_max_reservable_memory(perc_reserved_mem_max = 0):
+    max_reservable_memory = perc_reserved_mem_max * physical_memory
+    return  max_reservable_memory
 
 def _detect_main_towers(model, min_floors = 5):
     cur_blocks_prefix = None
@@ -214,7 +221,7 @@ def _get_model(model_path):
     _filename = _path[-1]
     _path = _path[:-1]
     if len(_path)<=1:
-        raise("file not found")
+        raise Exception("file not found")
     else:
         try:
             from huggingface_hub import  hf_hub_download #snapshot_download,    
@@ -258,11 +265,11 @@ def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
         assert t.is_pinned()
     return t
 
-def _safetensors_load_file(file_path):
+def _safetensors_load_file(file_path, writable_tensors = True):
     from collections import OrderedDict
     sd = OrderedDict()    
 
-    with safetensors2.safe_open(file_path, framework="pt", device="cpu") as f:
+    with safetensors2.safe_open(file_path, framework="pt", device="cpu", writable_tensors =writable_tensors) as f:
         for k in f.keys():
             sd[k] = f.get_tensor(k)
         metadata = f.metadata()
@@ -290,8 +297,9 @@ def _get_tensor_ref(p):
         return p.data_ptr()
 
 
-# BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
-BIG_TENSOR_MAX_SIZE = 2**27 # 128 MB
+BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
+BIG_TENSOR_MIN_SIZE = 2**26 # 64 MB
+RESERVED_RAM_MIN_AVAILABLE = 2**27 # 128 MB
 
 def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
     tied_weights = {}
@@ -322,7 +330,7 @@ def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
 
 def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
     global max_pinnable_bytes, total_pinned_bytes
-    if max_pinnable_bytes > 0 and  max_pinnable_bytes >= max_pinnable_bytes:
+    if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
 
         if  verboseLevel>=1 :
             print(f"Unable pin data of '{sd_name}' to reserved RAM as there is no reserved RAM left")
@@ -357,6 +365,12 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     last_big_tensor = 0
     total = 0  
 
+    try:
+        dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
+    except:
+        print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less 0.3")
+        return
+    
     for size in big_tensors_sizes:
         try:
             current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
@@ -367,6 +381,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
 
         last_big_tensor += 1
         total += size
+    del dummy_pinned_tensor
 
         
     tensor_no = 0
@@ -401,10 +416,10 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     return 
 
 
-def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
+def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1):
 
     global max_pinnable_bytes, total_pinned_bytes
-    if max_pinnable_bytes > 0 and  max_pinnable_bytes >= max_pinnable_bytes:
+    if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
 
         if  verboseLevel>=1 :
             print(f"Unable pin data of '{model_id}' to reserved RAM as there is no reserved RAM left")
@@ -414,6 +429,8 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
         towers_names, _ = _detect_main_towers(model)
 
 
+    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max)
+    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max) 
 
     current_big_tensor_size = 0
     big_tensor_no  = 0
@@ -474,7 +491,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                 length = torch.numel(p.data) * p.data.element_size() 
 
             ref_cache[ref] = (n, length)
-            if current_big_tensor_size + length > gig_tensor_size :
+            if current_big_tensor_size + length > big_tensor_size and current_big_tensor_size !=0  :
                 big_tensors_sizes.append(current_big_tensor_size)
                 current_big_tensor_size = 0
                 big_tensor_no += 1
@@ -498,31 +515,18 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     big_tensors_sizes.append(current_big_tensor_size)
 
     big_tensors = []
-    last_big_tensor = 0
     total = 0
     
 
     failed_planned_allocation = False
-
-    for size in big_tensors_sizes:
-        try:
-            # if total > 7000 * ONE_MB:
-            #     raise  Exception ("test no more reserved RAM")
-            current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
-            big_tensors.append(current_big_tensor)
-        except:
-            print(f"Unable to pin more tensors for this model as the maximum reservable memory has been reached ({total/ONE_MB:.2f})")
-            max_pinnable_bytes = total + total_pinned_bytes
-            failed_planned_allocation = True
-            break
-
-        last_big_tensor += 1
-        total += size
-
-
     gc.collect()
+    try:
+        dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
+    except:
+        print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less than{perc_reserved_mem_max}")
+        return
 
-        
+    last_allocated_big_tensor = -1        
     tensor_no = 0
     # prev_big_tensor = 0
     for n, (p, is_buffer) in params_dict.items():
@@ -543,39 +547,55 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                 assert p.data.is_pinned()
             q = None
         else:
-            big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
-            # if big_tensor_no != prev_big_tensor:
-            #     gc.collect()
-            #     prev_big_tensor = big_tensor_no
-            # match_param, match_isbuffer = tied_weights.get(n, (None, False))
-            # if match_param != None:
 
-            if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
-                current_big_tensor = big_tensors[big_tensor_no]
-                if is_buffer :
-                    _force_load_buffer(p) # otherwise potential memory leak
-                if isinstance(p, QTensor):
-                    if p._qtype == qint4:
-                        length1 = torch.numel(p._data._data) * p._data._data.element_size()
-                        p._data._data =  _move_to_pinned_tensor(p._data._data, current_big_tensor, offset, length1)
-                        if hasattr(p,"_scale_shift"):
-                            length2 = torch.numel(p._scale_shift) * p._scale_shift.element_size() 
-                            p._scale_shift = _move_to_pinned_tensor(p._scale_shift, current_big_tensor, offset + length1, length2)
-                        else:
-                            length2 = torch.numel(p._scale) * p._scale.element_size() 
-                            p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
-                            length3 = torch.numel(p._shift) * p._shift.element_size() 
-                            p._shift = _move_to_pinned_tensor(p._shift, current_big_tensor, offset + length1 + length2, length3)
+            big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
+            if last_allocated_big_tensor <  big_tensor_no:
+                last_allocated_big_tensor += 1
+                size = max(big_tensors_sizes[last_allocated_big_tensor], BIG_TENSOR_MIN_SIZE) 
+                try:
+                    if max_reservable_memory > 0 and ( (total_pinned_bytes + total + size) >= max_reservable_memory):
+                        dummy_pinned_tensor = None
+                        failed_planned_allocation = True
+                        max_pinnable_bytes = total_pinned_bytes + total
+                        break
+
+                    current_big_tensor = torch.empty( size, dtype= torch.uint8, pin_memory=True, device="cpu")
+                    big_tensors.append(current_big_tensor)
+                except:
+                    print(f"Unable to pin more tensors for this model as the maximum reservable memory has been reached ({total/ONE_MB:.2f}).")
+                    dummy_pinned_tensor = None
+                    failed_planned_allocation = True
+                    max_pinnable_bytes = total_pinned_bytes + total
+                    break
+
+                total += size
+
+            current_big_tensor = big_tensors[big_tensor_no]
+            if is_buffer :
+                _force_load_buffer(p) # otherwise potential memory leak
+            if isinstance(p, QTensor):
+                if p._qtype == qint4:
+                    length1 = torch.numel(p._data._data) * p._data._data.element_size()
+                    p._data._data =  _move_to_pinned_tensor(p._data._data, current_big_tensor, offset, length1)
+                    if hasattr(p,"_scale_shift"):
+                        length2 = torch.numel(p._scale_shift) * p._scale_shift.element_size() 
+                        p._scale_shift = _move_to_pinned_tensor(p._scale_shift, current_big_tensor, offset + length1, length2)
                     else:
-                        length1 = torch.numel(p._data) * p._data.element_size() 
-                        p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
                         length2 = torch.numel(p._scale) * p._scale.element_size() 
                         p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+                        length3 = torch.numel(p._shift) * p._shift.element_size() 
+                        p._shift = _move_to_pinned_tensor(p._shift, current_big_tensor, offset + length1 + length2, length3)
                 else:
-                    length = torch.numel(p.data) * p.data.element_size() 
-                    p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
+                    length1 = torch.numel(p._data) * p._data.element_size() 
+                    p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
+                    length2 = torch.numel(p._scale) * p._scale.element_size() 
+                    p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+            else:
+                length = torch.numel(p.data) * p.data.element_size() 
+                p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
             tensor_no += 1
         del p
+    del dummy_pinned_tensor
     model._pinned_bytes = total
     total_pinned_bytes += total
     del params_dict
@@ -583,9 +603,9 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
     if verboseLevel >=1:
         if partialPinning or failed_planned_allocation:        
-            print(f"The model was partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+            print(f"The model was partially pinned to reserved RAM: {last_allocated_big_tensor + 1} large blocks spread across {total/ONE_MB:.2f} MB")
         else:
-            print(f"The whole model was pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
+            print(f"The whole model was pinned to reserved RAM: {last_allocated_big_tensor + 1} large blocks spread across {total/ONE_MB:.2f} MB")
 
     model._already_pinned = True
 
@@ -598,8 +618,23 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.3.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.4.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
+def change_dtype(model, new_dtype, exclude_buffers = False):
+    for submodule_name, submodule in model.named_modules():  
+        if hasattr(submodule, "_lock_dtype"):
+            continue
+        for n, p in submodule.named_parameters(recurse = False):
+            if p.data.dtype != new_dtype:
+                p.data = p.data.to(new_dtype)
+
+        if not exclude_buffers:
+            for p in submodule.buffers(recurse=False):
+                if p.data.dtype != new_dtype:
+                    p.data = p.data.to(new_dtype)
+
+    return model
+            
 def _extract_num_from_str(num_in_str):
     size = len(num_in_str)
     for i in range(size):
@@ -735,12 +770,16 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
                 tied_weights[submodule_name]=  (n, ) + match 
             else:
                 cache_ref[ref] = (submodule_name, n)
-                size  += torch.numel(p.data) * sizeofbfloat16
+                size  += torch.numel(p.data) * sizeofhalffloat
 
         for p in submodule.buffers(recurse=False):
-            size  += torch.numel(p.data) * sizeofbfloat16
+            size  += torch.numel(p.data) * sizeofhalffloat
 
-
+        already_added = False
+        if hasattr(submodule, "_lock_dtype"):
+            submodule_size += size
+            submodule_names.append(submodule_name)
+            already_added = True
 
         if not any(submodule_name.startswith(pre) for pre in tower_names):
             flush = False
@@ -758,8 +797,9 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
                 submodule_size = 0
                 submodule_names = []
             prev_blocks_prefix = cur_blocks_prefix
-            submodule_size += size
-            submodule_names.append(submodule_name)
+            if not already_added:
+                submodule_size += size
+                submodule_names.append(submodule_name)
         total_size += size
 
     if submodule_size >0  : 
@@ -860,7 +900,7 @@ def split_linear_modules(model, map ):
                     sub_bias = torch.split(bias, split_sizes, dim=0)
                     for sub_name, _subdata, _subbias, _subscale in zip(mapped_modules, sub_data, sub_bias, sub_scale):
                         with init_empty_weights():
-                            sub_module = QLinear(_subdata.shape[1], _subdata.shape[0], bias=bias != None, device ="cpu", dtype=torch.bfloat16)
+                            sub_module = QLinear(_subdata.shape[1], _subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
                         sub_module.weight = torch.nn.Parameter(WeightQBytesTensor.create(weight.qtype, weight.axis, _subdata.size(), weight.stride(), _subdata, _subscale, activation_qtype=weight.activation_qtype, requires_grad=weight.requires_grad ))
                         if bias != None:                        
                             sub_module.bias = torch.nn.Parameter(_subbias)
@@ -873,7 +913,7 @@ def split_linear_modules(model, map ):
                     sub_bias = torch.split(bias, split_sizes, dim=0)
                     for sub_name, subdata, subbias in zip(mapped_modules, sub_data, sub_bias):
                         with init_empty_weights():
-                            sub_module = torch.nn.Linear( subdata.shape[1], subdata.shape[0], bias=bias != None, device ="cpu", dtype=torch.bfloat16)
+                            sub_module = torch.nn.Linear( subdata.shape[1], subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
                         sub_module.weight = torch.nn.Parameter(subdata , requires_grad=False)
                         if bias != None:
                             sub_module.bias = torch.nn.Parameter(subbias)
@@ -884,17 +924,15 @@ def split_linear_modules(model, map ):
 
 def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
     verboseLevel = _compute_verbose_level(verboseLevel)
-    modules_dict = {k: v for k,v in model.named_modules()}
 
+    loras_model_data = getattr(model, "_loras_model_data", None)
+    if loras_model_data == None:
+        raise Exception(f"No Loras has been declared for this model while creating the corresponding offload object")
+    
     if not check_only:
-        loras_model_data = dict()
-        model._loras_model_data = loras_model_data
-        loras_active_adapters = set()
-        model._loras_active_adapters = loras_active_adapters
-        loras_scaling = dict()
-        model._loras_scaling = loras_scaling
-        loras_tied_weights = dict()
-        model._loras_tied_weights = loras_tied_weights
+        unload_loras_from_model(model)
+
+    modules_dict = {k: v for k,v in model.named_modules()}
 
     CrLf = '\r\n'
     error_msg = ""
@@ -932,10 +970,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             continue
         fail = False
         skip = False
-        state_dict = safetensors2.torch_load_file(path)
-
-
-
+        state_dict = safetensors2.torch_load_file(path, writable_tensors= False)
 
         if preprocess_sd != None:
             state_dict = preprocess_sd(state_dict)
@@ -1052,12 +1087,13 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         break
                 if not check_only:
                     loras_module_data = loras_model_data.get(module, None)
-                    if loras_module_data == None:
-                        loras_module_data = dict()
-                        loras_model_data[module] = loras_module_data
+                    assert loras_module_data != None
+                    # if loras_module_data == None:
+                    #     loras_module_data = dict()
+                    #     loras_model_data[module] = loras_module_data
                     loras_adapter_data =  loras_module_data.get(adapter_name, None)
-                    lora_A = None if lora_A == None else lora_A.to(torch.bfloat16) 
-                    lora_B = None if lora_B == None else lora_B.to(torch.bfloat16) 
+                    lora_A = None if lora_A == None else lora_A.to(module.weight.dtype) 
+                    lora_B = None if lora_B == None else lora_B.to(module.weight.dtype) 
                     if loras_adapter_data == None:
                         alpha = lora_alphas.get(k[:-len("lora_X.weight")] + "alpha", 1.) 
                         loras_adapter_data = [lora_A, lora_B, alpha]
@@ -1115,11 +1151,16 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     return new_lora_path
 
 def unload_loras_from_model(model):
-    model._loras_model_data = None
+    for _, v in model._loras_model_data.items():
+        v.clear()
+
+    model._loras_active_adapters = set()
+    model._loras_scaling = dict()
+    model._loras_tied_weights = dict()
     model._loras_errors = None
     model._loras_adapters = None
-    model._loras_active_adapters = None
     model._loras_scaling = None
+
 
 def set_step_no_for_lora(model, step_no):
     model._lora_step_no = step_no
@@ -1151,7 +1192,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, modelClass=None, modelPrefix = None, verboseLevel = -1):
+def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1167,7 +1208,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
     
     verboseLevel = _compute_verbose_level(verboseLevel)
 
-    with safetensors2.safe_open(model_path) as f:
+    with safetensors2.safe_open(model_path, writable_tensors =writable_tensors) as f:
         metadata = f.metadata() 
 
     if metadata is None:
@@ -1231,13 +1272,13 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors ,verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, verboseLevel = -1):
+def load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -1275,7 +1316,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
         if "module" in state_dict:
             state_dict = state_dict["module"]
     else:
-        state_dict, metadata = _safetensors_load_file(file_path)
+        state_dict, metadata = _safetensors_load_file(file_path, writable_tensors =writable_tensors)
             
         if metadata is None:
             quantization_map = None
@@ -1326,9 +1367,13 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             if k.endswith(missing_keys[0]):
                 base_model_prefix = k[:-len(missing_keys[0])]
                 break
-        state_dict = filter_state_dict(state_dict,base_model_prefix)
+        if base_model_prefix == None:
+            raise Exception("Missing keys: {missing_keys}")
+        state_dict = filter_state_dict(state_dict, base_model_prefix)
         missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
     del state_dict
+    if len(unexpected_keys) > 0 and verboseLevel >=2:
+        print(f"Unexpected keys while loading '{file_path}': {unexpected_keys}")
 
     for k,p in model.named_parameters():
         if p.is_meta:
@@ -1470,7 +1515,6 @@ class offload:
     def __init__(self):
         self.active_models = []
         self.active_models_ids = []
-        self.active_subcaches = {}        
         self.models = {}
         self.cotenants_map = { 
                             "text_encoder": ["vae", "text_encoder_2"],
@@ -1490,6 +1534,7 @@ class offload:
         self.transfer_stream = torch.cuda.Stream()
         self.async_transfers = False
         self.parameters_ref  = {} 
+        self.max_reservable_memory = 0
 
         global last_offload_obj
         last_offload_obj = self
@@ -1732,27 +1777,26 @@ class offload:
  
         self.active_models = []
         self.active_models_ids = []
-        self.active_subcaches = []
         torch.cuda.empty_cache()
         gc.collect()
         self.last_reserved_mem_check = time.time()
 
-    def move_args_to_gpu(self, *args, **kwargs):
+    def move_args_to_gpu(self, dtype, *args, **kwargs):
         new_args= []
         new_kwargs={}
+
         for arg in args:
             if torch.is_tensor(arg):    
                 if arg.dtype == torch.float32:
-                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
+                    arg = arg.to(dtype).cuda(non_blocking=True)
                 elif not arg.is_cuda:
                     arg = arg.cuda(non_blocking=True)
             new_args.append(arg)
-
         for k in kwargs:
             arg = kwargs[k]
             if torch.is_tensor(arg):
                 if arg.dtype == torch.float32:
-                    arg = arg.to(torch.bfloat16).cuda(non_blocking=True)             
+                    arg = arg.to(dtype).cuda(non_blocking=True)             
                 elif not arg.is_cuda:
                     arg = arg.cuda(non_blocking=True)             
             new_kwargs[k]= arg
@@ -1813,7 +1857,7 @@ class offload:
         loras_scaling = model._loras_scaling
         training = False
 
-
+        dtype = weight.dtype 
         if weight.shape[-1] < x.shape[-2] : # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
             if len(active_adapters) > 0:
                 if isinstance(submodule, QModuleMixin): 
@@ -1841,7 +1885,7 @@ class offload:
             result = torch.nn.functional.linear(x, weight, bias=submodule.bias)
 
             if len(active_adapters) > 0:
-                x = x.to(torch.bfloat16)
+                x = x.to(dtype)
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
@@ -1866,14 +1910,14 @@ class offload:
         return result
 
 
-    def hook_lora_linear(self, submodule, current_model, model_id, submodule_name):
+    def hook_lora_linear(self, submodule, current_model, model_id, loras_model_data, submodule_name):
         old_forward = submodule.forward
+
+        loras_data = {}
+        loras_model_data[submodule] = loras_data
+
         def  lora_linear_forward(module,  *args, **kwargs):
-            loras_model_data = getattr(current_model, "_loras_model_data", None)
-            loras_data = None
-            if loras_model_data != None:
-                loras_data = loras_model_data.get(submodule, None)
-            if loras_data == None:
+            if len(loras_data) == 0:
                 return old_forward(*args, **kwargs)
             else:
                 return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
@@ -1881,7 +1925,7 @@ class offload:
         return functools.update_wrapper(functools.partial(lora_linear_forward, submodule), old_forward)
 
     def ensure_model_loaded(self, model_id):
-        if  model_id in self.active_models_ids:
+        if model_id in self.active_models_ids:
             return
         # new_model_id = getattr(module, "_mm_id") 
         # do not always unload existing models if it is more efficient to keep in them in the GPU 
@@ -1903,8 +1947,9 @@ class offload:
         target_module.register_forward_pre_hook(preload_blocks_for_compile)        
 
 
-    def hook_check_empty_cache_needed(self, target_module, model_id, blocks_name, previous_method,  context):
+    def hook_check_empty_cache_needed(self, target_module, model, model_id, blocks_name, previous_method,  context):
 
+        dtype = model._dtype
         qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
         if qint4quantization:
             pass
@@ -1929,8 +1974,8 @@ class offload:
                     self.empty_cache_if_needed()
             elif blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
                 self.gpu_load_blocks(model_id, blocks_name)
-            if qint4quantization:
-                args, kwargs = self.move_args_to_gpu(*args, **kwargs)
+            if qint4quantization and dtype !=None:
+                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
 
             return previous_method(*args, **kwargs) 
 
@@ -1941,11 +1986,16 @@ class offload:
 
         
     def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
+        if hasattr(target_module, "_lock_dtype"):
+            dtype = target_module._lock_dtype 
+        else:
+            dtype = model._dtype
 
         def check_change_module(module, *args, **kwargs):            
             self.ensure_model_loaded(model_id)
             # transfer leftovers inputs that were incorrectly created in the RAM (mostly due to some .device tests that returned incorrectly "cpu")
-            args, kwargs = self.move_args_to_gpu(*args, **kwargs)
+            if dtype != None:
+                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
             return previous_method(*args, **kwargs) 
   
         if hasattr(target_module, "_mm_id"):
@@ -2051,13 +2101,15 @@ class offload:
             last_offload_obj = None
 
         self.unload_all()
-        self.default_stream = None
+        self.active_models = None
+        self.default_stream = None 
+        self.transfer_stream = None
+        self.parameters_ref = None
         keys= [k for k in self.blocks_of_modules.keys()]
         for k in keys:
             del self.blocks_of_modules[k]
 
         self.blocks_of_modules = None
-
 
         for model_id, model in self.models.items():
             move_loras_to_device(model, "cpu")
@@ -2065,6 +2117,7 @@ class offload:
                 total_pinned_bytes -= model._pinned_bytes
             if hasattr(model, "_loras_model_data"):
                 unload_loras_from_model(model)
+            model = None
 
         self.models = None            
 
@@ -2074,7 +2127,7 @@ class offload:
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -2088,6 +2141,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     self.verboseLevel = verboseLevel
     safetensors2.verboseLevel = verboseLevel
     self.modules_data = {}
+    
     model_budgets = {}
 
     windows_os =  os.name == 'nt'
@@ -2164,9 +2218,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
       #  torch._logging.set_logs(recompiles=True)
       #  torch._inductor.config.realize_opcount_threshold = 100 # workaround bug "AssertionError: increase TRITON_MAX_BLOCK['X'] to 4096."
 
-     
-    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max) 
-    max_reservable_memory = perc_reserved_mem_max * physical_memory
+    perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max)
+    max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max) 
 
     estimatesBytesToPin = 0
     for model_id in models: 
@@ -2181,31 +2234,39 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         modelPinned = (pinAllModels or model_id in modelsToPin) and not hasattr(current_model,"_already_pinned")
 
         current_model_size = 0
+        model_dtype = None
+        
+        for _ , m in current_model.named_modules():
+            ignore_dtype = hasattr(m, "_lock_dtype")
+            for n, p in m.named_parameters(recurse = False):
+                p.requires_grad = False
+                if isinstance(p, QTensor):
+                    if p._qtype == qint4:
+                        if hasattr(p,"_scale_shift"):
+                            current_model_size +=  torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        else:
+                            current_model_size +=  torch.numel(p._scale) * p._shift.element_size() + torch.numel(p._scale) * p._shift.element_size()
 
-        for n, p in current_model.named_parameters():
-            p.requires_grad = False
-            if isinstance(p, QTensor):
-                # # fix quanto bug (seems to have been fixed)   
-                # if not modelPinned and p._scale.dtype == torch.float32:
-                #     p._scale = p._scale.to(torch.bfloat16) 
-                if p._qtype == qint4:
-                    if hasattr(p,"_scale_shift"):
-                        current_model_size +=  torch.numel(p._scale_shift) * p._scale_shift.element_size()
+                        current_model_size +=  torch.numel(p._data._data) * p._data._data.element_size()
+
                     else:
-                        current_model_size +=  torch.numel(p._scale) * p._shift.element_size() + torch.numel(p._scale) * p._shift.element_size()
-
-                    current_model_size +=  torch.numel(p._data._data) * p._data._data.element_size()
+                        current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
+                        current_model_size +=  torch.numel(p._data) * p._data.element_size()
+                    dtype = p._scale.dtype
 
                 else:
-                    current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
-                    current_model_size +=  torch.numel(p._data) * p._data.element_size()
-
-            else:
-                if p.data.dtype == torch.float32:
-                    # convert any left overs float32 weight to bloat16 to divide by 2 the model memory footprint
-                    p.data = p.data.to(torch.bfloat16)
-                current_model_size +=  torch.numel(p.data) * p.data.element_size()
-                            
+                    if not ignore_dtype:
+                        dtype = p.data.dtype
+                        if convertWeightsFloatTo != None and  dtype == torch.float32 :
+                            # convert any left overs float32 weight to bfloat16 / float16 to divide by 2 the model memory footprint
+                            dtype = convertWeightsFloatTo if model_dtype == None else model_dtype
+                            p.data = p.data.to(dtype)
+                        if model_dtype== None:
+                            model_dtype = dtype
+                        else:
+                            assert model_dtype == dtype
+                    current_model_size +=  torch.numel(p.data) * p.data.element_size()
+                current_model._dtype = model_dtype
         for b in current_model.buffers():
             # do not convert 32 bits float to 16 bits since buffers are few (and potential gain low) and usually they are needed for precision calculation (for instance Rope)
             current_model_size +=  torch.numel(b.data) * b.data.element_size()
@@ -2273,12 +2334,15 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 if self.verboseLevel >=1:
                     print(f"Model '{model_id}' already pinned to reserved memory")
             else:
-                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, verboseLevel=verboseLevel)            
+                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel)            
     
         current_budget = model_budgets[model_id]
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
         self.loaded_blocks[model_id] = None
-        any_lora =  loras !=None and model_id in loras  or getattr(current_model, "_loras_model_data", False)
+        any_lora =  loras !=None and model_id in loras
+        if any_lora: 
+            loras_model_data = {}
+            current_model._loras_model_data = loras_model_data 
         for submodule_name, submodule in current_model.named_modules():  
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -2311,7 +2375,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
  
             if hasattr(submodule, "forward"):
                 if  any_lora and isinstance(submodule, torch.nn.Linear):
-                    submodule_method = self.hook_lora_linear(submodule, current_model, model_id, submodule_name)
+                    submodule_method = self.hook_lora_linear(submodule, current_model, model_id, loras_model_data, submodule_name)
                 else:
                     submodule_method = getattr(submodule, "forward")
                 if callable(submodule_method):   
@@ -2320,7 +2384,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     elif compilationInThisOne and submodule in towers_modules: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
-                        self.hook_check_empty_cache_needed(submodule, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+                        self.hook_check_empty_cache_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
 
                 self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
 

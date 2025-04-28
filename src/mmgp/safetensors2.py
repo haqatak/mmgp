@@ -1,4 +1,4 @@
-# ------------------ Safetensors2 1.0 by DeepBeepMeep (mmgp)------------------
+# ------------------ Safetensors2 1.1 by DeepBeepMeep (mmgp)------------------
 #
 # This module entirely written in Python is a replacement for the safetensor library which requires much less RAM to load models.
 # It can be conveniently used to keep a low RAM consumption when handling  transit data (for instance when quantizing or transferring tensors to reserver RAM)
@@ -16,12 +16,14 @@ import safetensors
 import accelerate
 import os
 from collections import OrderedDict
+import warnings
 
+warnings.filterwarnings("ignore", ".*The given buffer is not writable, and PyTorch does not support non-writable tensors*")
 
 _old_torch_load_file = None
 _old_safe_open = None
 
-
+all_tensors_are_read_only = False 
 
 mmm = {}
 verboseLevel = 1
@@ -232,7 +234,7 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None, extr
 class SafeTensorFile:
     """Main class for accessing safetensors files that provides memory-efficient access"""
     
-    def __init__(self, file_path, metadata, catalog, skip_bytes, lazy_loading = True):
+    def __init__(self, file_path, metadata, catalog, skip_bytes, lazy_loading = True, writable_tensors = True):
         self._file_path = file_path
         self._metadata = metadata
         self._catalog = catalog
@@ -241,19 +243,20 @@ class SafeTensorFile:
         self.sd = None
         self.mtracker = None
         self.lazy_loading = lazy_loading
+        self.writable_tensors = writable_tensors
 
     @classmethod
-    def load_metadata(cls, file_path, lazy_loading = True):
+    def load_metadata(cls, file_path, lazy_loading = True, writable_tensors = True):
         with open(file_path, 'rb') as f:
             catalog, metadata, skip_bytes = _read_safetensors_header(file_path, f)
 
-        return cls(file_path, metadata, catalog, skip_bytes, lazy_loading)
+        return cls(file_path, metadata, catalog, skip_bytes, lazy_loading, writable_tensors )
 
-    def init_tensors(self, lazyTensors = True):
+    def init_tensors(self, lazyTensors = True, writable_tensors = True):
         if self.sd is None:
             self.lazy_loading = lazyTensors
             if lazyTensors:
-                self.sd = self.create_tensors_with_mmap()
+                self.sd = self.create_tensors_with_mmap(writable_tensors)
             else:
                 self.sd = self.create_tensors_without_mmap()
         # else:
@@ -263,7 +266,7 @@ class SafeTensorFile:
         return self.sd
     
             
-    def create_tensors_with_mmap(self):
+    def create_tensors_with_mmap(self, writable_tensors = True):
  
         self.mtracker = MmapTracker(self._file_path)
         import mmap
@@ -302,7 +305,7 @@ class SafeTensorFile:
         with open(self._file_path, 'rb') as f:
             i = 0
             for map_start, map_size in maps_info:
-                mm = mmap.mmap(f.fileno(), map_size, offset=map_start, access=mmap.ACCESS_COPY) #.ACCESS_READ
+                mm = mmap.mmap(f.fileno(), map_size, offset=map_start, access=  mmap.ACCESS_COPY  if writable_tensors else mmap.ACCESS_READ) 
                 maps.append((mm, map_start, map_size))
                 self.mtracker.register(mm, i, map_start, map_size)
                 i = i+ 1
@@ -359,7 +362,7 @@ class SafeTensorFile:
     def get_tensor(self, name: str) -> torch.tensor:
         """Get a tensor by name"""
         # To do : switch to a JIT tensor creation per tensor
-        self.init_tensors()
+        self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return self.sd[name]
  
     def keys(self) -> List[str]:
@@ -374,7 +377,7 @@ class SafeTensorFile:
         
     def tensors(self) -> Dict[str, torch.tensor]:
         """Get dictionary of all tensors"""
-        self.init_tensors(self.lazy_loading)
+        self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return self.sd
         
     def metadata(self) -> Optional[Dict[str, str]]:
@@ -383,7 +386,7 @@ class SafeTensorFile:
         
     def __len__(self) -> int:
         """Get number of tensors"""
-        self.init_tensors(self.lazy_loading)
+        self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return len(self.keys())
         
     def __contains__(self, key: str) -> bool:
@@ -401,17 +404,22 @@ class SafeTensorFile:
 class _SafeTensorLoader:
     """Context manager for loading SafeTensorFile"""
     
-    def __init__(self, filename: str ):
+    def __init__(self, filename: str, writable_tensors = True ):
         self.filename = Path(filename)
+        self.writable_tensors = writable_tensors
         self.sft = None
         if not self.filename.exists():
             raise FileNotFoundError(f"File not found: {filename}")
             
     def __enter__(self) -> SafeTensorFile:
         """Open file and return SafeTensorFile instance"""
-        
+        writable_tensors = self.writable_tensors
+
+        if all_tensors_are_read_only:
+            writable_tensors = False
+
         try:
-            self.sft = SafeTensorFile.load_metadata(self.filename)
+            self.sft = SafeTensorFile.load_metadata(self.filename, writable_tensors= writable_tensors)
             return self.sft 
             
         except Exception as e:
@@ -428,14 +436,14 @@ class _SafeTensorLoader:
         pass
 
 
-def safe_open(filename: str, framework: str = "pt",device = "cpu") -> _SafeTensorLoader:
+def safe_open(filename: str, framework: str = "pt",device = "cpu", writable_tensors = True) -> _SafeTensorLoader:
     if device != "cpu" or framework !="pt":
         return _old_safe_open(filename =filename, framework=framework, device=device)
-    return _SafeTensorLoader(filename)
+    return _SafeTensorLoader(filename, writable_tensors = writable_tensors)
 
-def torch_load_file( filename, device = 'cpu' ) -> Dict[str, torch.Tensor]:
+def torch_load_file( filename, device = 'cpu', writable_tensors = True) -> Dict[str, torch.Tensor]:
     sd = {}
-    with safe_open(filename, framework="pt", device = device ) as f:
+    with safe_open(filename, framework="pt", device = device, writable_tensors =writable_tensors  ) as f:
         for k in f.keys():
             sd[k] = f.get_tensor(k)
         return sd
