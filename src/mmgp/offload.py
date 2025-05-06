@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.4.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.4.3 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -61,6 +61,7 @@ import sys
 import os
 import json
 import psutil
+import builtins
 from accelerate import init_empty_weights
 
 
@@ -299,7 +300,7 @@ def _get_tensor_ref(p):
 
 BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
 BIG_TENSOR_MIN_SIZE = 2**26 # 64 MB
-RESERVED_RAM_MIN_AVAILABLE = 2**27 # 128 MB
+RESERVED_RAM_MIN_AVAILABLE = BIG_TENSOR_MAX_SIZE # 2**27 # 128 MB
 
 def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
     tied_weights = {}
@@ -618,7 +619,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.4.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.4.3) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1200,15 +1201,20 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
 
     
     import os.path
- 
-    if not (model_path.endswith(".sft") or model_path.endswith(".safetensors")):
+    if not isinstance(model_path, list):
+        model_path = [model_path]
+
+
+    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") for file_name in model_path):
         raise Exception("full model path to file expected")
 
-    model_path = _get_model(model_path)
+    model_path = [ _get_model(file) for file in model_path] 
+    if any( file == None for file in model_path):
+        raise Exception("Unable to find file")
     
     verboseLevel = _compute_verbose_level(verboseLevel)
 
-    with safetensors2.safe_open(model_path, writable_tensors =writable_tensors) as f:
+    with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
         metadata = f.metadata() 
 
     if metadata is None:
@@ -1220,7 +1226,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         if forcedConfigPath != None:
             config_fullpath = forcedConfigPath
         else:
-            config_fullpath =  os.path.join(os.path.dirname(model_path), "config.json")
+            config_fullpath =  os.path.join(os.path.dirname(model_path[-1]), "config.json")
 
         if not os.path.isfile(config_fullpath):
             raise Exception("a 'config.json' that describes the model is required in the directory of the model or inside the safetensor file")
@@ -1282,9 +1288,11 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
+    if not isinstance(file_path, list):
+        file_path = [file_path]
 
-    file_path = _get_model(file_path)
-    if file_path == None:
+    file_path = [ _get_model(file) for file in file_path] 
+    if any( file == None for file in file_path):
         raise Exception("Unable to find file")
     verboseLevel = _compute_verbose_level(verboseLevel)
 
@@ -1309,60 +1317,85 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             new_state_dict[k[ start:]] = v
         return new_state_dict
 
-    if not (".safetensors" in file_path or ".sft" in file_path): 
-        if pinToMemory:
-            raise Exception("Pinning to memory while loading only supported for safe tensors files")
-        state_dict = torch.load(file_path, weights_only=True)
-        if "module" in state_dict:
-            state_dict = state_dict["module"]
-    else:
-        state_dict, metadata = _safetensors_load_file(file_path, writable_tensors =writable_tensors)
+    full_quantization_map = {}
+    full_tied_weights_map = {}
+    full_state_dict = {}
+    for file in file_path:
+        quantization_map = None
+        tied_weights_map = None
+        if not (".safetensors" in file or ".sft" in file): 
+            if pinToMemory:
+                raise Exception("Pinning to memory while loading only supported for safe tensors files")
+            state_dict = torch.load(file, weights_only=True)
+            if "module" in state_dict:
+                state_dict = state_dict["module"]
             
-        if metadata is None:
-            quantization_map = None
-            tied_weights_map = None
         else:
-            quantization_map = metadata.get("quantization_map", None)
-            config = metadata.get("config", None)
-            if config is not None:
-                model._config = config
+            basename = os.path.basename(file)
 
-            tied_weights_map = metadata.get("tied_weights_map", None)
-            if tied_weights_map != None:
-                for name, tied_weights_list in tied_weights_map.items():
-                    mapped_weight = state_dict[name]
-                    for tied_weights in tied_weights_list:
-                        state_dict[tied_weights] = mapped_weight
+            if "model-0" in basename:
+                metadata = None
+                file_parts= basename.split("-")
+                parts_max = int(file_parts[-1][:5])
+                state_dict = {}
+                for i in range(1, parts_max + 1):
+                    file_parts[1] = ("0000" + str(i))[:5]
+                    sd, _ = _safetensors_load_file( os.path.join( os.path.dirname(file), "-".join(file_parts) ) , writable_tensors =writable_tensors)
+                    state_dict.update(sd)
+            else:
+                state_dict, metadata = _safetensors_load_file(file, writable_tensors =writable_tensors)
+                
+            if metadata !=  None:
+                quantization_map = metadata.get("quantization_map", None)
+                config = metadata.get("config", None)
+                if config is not None:
+                    model._config = config
+
+                tied_weights_map = metadata.get("tied_weights_map", None)
+                if tied_weights_map != None:
+                    for name, tied_weights_list in tied_weights_map.items():
+                        mapped_weight = state_dict[name]
+                        for tied_weights in tied_weights_list:
+                            state_dict[tied_weights] = mapped_weight
+
+            if quantization_map is None:
+                pos = str.rfind(file, ".")
+                if pos > 0:
+                    quantization_map_path = file[:pos]
+                quantization_map_path += "_map.json"
+
+                if os.path.isfile(quantization_map_path):
+                    with open(quantization_map_path, 'r') as f:
+                        quantization_map = json.load(f)
+        
+        full_state_dict.update(state_dict)
+        if quantization_map != None:
+            full_quantization_map.update(quantization_map)
+        if tied_weights_map != None:
+            full_tied_weights_map.update(tied_weights_map)
+
+    state_dict, quantization_map, tied_weights_map  = full_state_dict, full_quantization_map, full_tied_weights_map
+    full_state_dict, full_quantization_map, full_tied_weights_map = None, None, None
+
+    # deal if we are trying to load just a sub part of a larger model
+    if modelPrefix != None:
+        base_model_prefix = modelPrefix + "."
+        state_dict = filter_state_dict(state_dict,base_model_prefix)
+        if quantization_map != None:
+            quantization_map = filter_state_dict(quantization_map,base_model_prefix)
+
+    if len(quantization_map) == 0:
+        if any("quanto" in file for file in file_path) and not do_quantize:
+            print("Model seems to be quantized by quanto but no quantization map was found whether inside the model or in a separate '{file_path[:json]}_map.json' file")
+    else:
+        _requantize(model, state_dict, quantization_map)    
 
 
-
-        if quantization_map is None:
-            pos = str.rfind(file_path, ".")
-            if pos > 0:
-                quantization_map_path = file_path[:pos]
-            quantization_map_path += "_map.json"
-
-            if os.path.isfile(quantization_map_path):
-                with open(quantization_map_path, 'r') as f:
-                    quantization_map = json.load(f)
-
-
-        # deal if we are trying to load just a sub part of a larger model
-        if modelPrefix != None:
-            base_model_prefix = modelPrefix + "."
-            state_dict = filter_state_dict(state_dict,base_model_prefix)
-            if quantization_map != None:
-                quantization_map = filter_state_dict(quantization_map,base_model_prefix)
-
-        if quantization_map is None :
-            if "quanto" in file_path and not do_quantize:
-                print("Model seems to be quantized by quanto but no quantization map was found whether inside the model or in a separate '{file_path[:json]}_map.json' file")
-        else:
-            _requantize(model, state_dict, quantization_map)    
 
     missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
     if len(missing_keys) > 0 :
         # if there is a key mismatch maybe we forgot to remove some prefix
+        base_model_prefix = None
         for k,v in state_dict.items():
             if k.endswith(missing_keys[0]):
                 base_model_prefix = k[:-len(missing_keys[0])]
@@ -1385,7 +1418,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             raise Exception(txt)
 
     if do_quantize:
-        if quantization_map is None:
+        if quantization_map != None and len(quantization_map) > 0 :
             if _quantize(model, quantizationType, verboseLevel=verboseLevel, model_id=file_path):
                 quantization_map = model._quanto_map  
         else:
@@ -1716,7 +1749,7 @@ class offload:
     @torch.compiler.disable()
     def gpu_unload_blocks(self, model_id, blocks_name):
         # cl = clock.start()
-        if blocks_name != None:
+        if blocks_name != None and blocks_name == self.loaded_blocks[model_id]:
             self.loaded_blocks[model_id] = None 
 
 
@@ -1772,7 +1805,13 @@ class offload:
 
             loaded_block = self.loaded_blocks[model_id]
             if loaded_block != None:
-                self.gpu_unload_blocks(model_id, loaded_block)      
+                self.gpu_unload_blocks(model_id, loaded_block)
+                entry_name = model_id + "/" + loaded_block
+                next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
+                if next_blocks_entry != None:
+                    pos = next_blocks_entry.rfind("/")
+                    torch.cuda.synchronize()
+                    self.gpu_unload_blocks(model_id, next_blocks_entry[pos+1:])      
                 self.loaded_blocks[model_id] = None  
  
         self.active_models = []
@@ -2264,6 +2303,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                         if model_dtype== None:
                             model_dtype = dtype
                         else:
+                            if model_dtype != dtype:
+                                pass
                             assert model_dtype == dtype
                     current_model_size +=  torch.numel(p.data) * p.data.element_size()
                 current_model._dtype = model_dtype

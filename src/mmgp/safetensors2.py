@@ -77,6 +77,24 @@ class MmapTracker:
     def get_active_maps(self):
         return dict(self._maps)
 
+class tensor_slice:
+    catalog = None
+    value = None
+    name = None
+
+    def __init__(self, catalog, name, value):
+        self.catalog = catalog
+        self.value = value
+        self.name = name
+
+    def __getitem__(self, s):
+        return self.value[s]
+ 
+    def get_dtype(self):
+        return self.catalog[self.name]["dtype"]
+
+    def get_shape(self):
+        return self.catalog[self.name]["shape"]
 
 class cached_metadata:
     file_path = None
@@ -359,6 +377,9 @@ class SafeTensorFile:
                 sd[k] = t
         return sd
 
+    def get_slice(self, name: str) -> torch.tensor:
+        return tensor_slice(self._catalog, name, self.get_tensor(name))
+    
     def get_tensor(self, name: str) -> torch.tensor:
         """Get a tensor by name"""
         # To do : switch to a JIT tensor creation per tensor
