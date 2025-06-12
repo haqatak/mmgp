@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 3.4.3 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.4.9 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -28,7 +28,7 @@ Each profile may use a combination of the following:
 ## Sample applications that use mmgp
 It is recommended to have a look at these applications to see how mmgp was implemented in each of them:
 - Wan2GP: https://github.com/deepbeepmeep/Wan2GP :\
-An excellent text to video and image to video generator by Alibaba
+An excellent text to video and image to video generator that supports the best Open Source Video Architectures: Wan, Hunyuan and LTX Video
 
 - Hunyuan3D-2GP: https://github.com/deepbeepmeep/Hunyuan3D-2GP :\
 A great image to 3D and text to 3D tool by the Tencent team. Thanks to mmgp it can run with less than 6 GB of VRAM
