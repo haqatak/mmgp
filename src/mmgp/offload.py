@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.4.9 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.5.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -658,7 +658,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.4.9) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1019,33 +1019,18 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
 
         if split_linear_modules_map != None:
             new_state_dict = dict()
-            targets_A = { "."+k+".lora_A.weight" : k for k in split_linear_modules_map }         
-            targets_B = { "."+k+".lora_B.weight" : k for k in split_linear_modules_map }         
+            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False)]
             for module_name, module_data in state_dict.items():
-                if any(module_name.endswith(suffix) for suffix in targets_B):
-                    for suffix, target_module  in targets_B.items():
-                        if module_name.endswith(suffix):
-                            break
-                    parent_module_name = module_name[:-len(suffix)]
-                    map = split_linear_modules_map[target_module]        
-                    mapped_modules = map["mapped_modules"]
-                    split_sizes = map["split_sizes"]
-                    sub_data = torch.split(module_data, split_sizes, dim=0)
-                    for sub_name, subdata,  in zip(mapped_modules, sub_data):
-                        new_module_name = parent_module_name + "." + sub_name + ".lora_B.weight"
-                        new_state_dict[new_module_name] = subdata
-                elif any(module_name.endswith(suffix) for suffix in targets_A):
-                    for suffix, target_module  in targets_A.items():
-                        if module_name.endswith(suffix):
-                            break
-                    parent_module_name = module_name[:-len(suffix)]
-                    map = split_linear_modules_map[target_module]        
-                    mapped_modules = map["mapped_modules"]
-                    for sub_name  in mapped_modules :
-                        new_module_name = parent_module_name + "." + sub_name + ".lora_A.weight"
-                        new_state_dict[new_module_name] = module_data
-                else:
-                    new_state_dict[module_name] = module_data            
+                name_parts = module_name.split(".")
+                for suffix, pos, any_split in suffixes: 
+                    if module_name.endswith(suffix) and (map := split_linear_modules_map.get(name_parts[pos], None )) != None:
+                        parent_module_name, module_name = ".".join(name_parts[:pos]), None
+                        sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else [None] * len(map["mapped_modules"])  
+                        for sub_name, subdata in zip(map["mapped_modules"], sub_data):
+                            new_module_name = parent_module_name + "." + sub_name + suffix
+                            new_state_dict[new_module_name] = subdata if any_split else module_data
+                        break
+                if module_name != None: new_state_dict[module_name] = module_data            
             state_dict = new_state_dict
             del new_state_dict
             # tied_weights = _extract_tie_weights_from_sd(state_dict, path) # to do
@@ -1118,7 +1103,9 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                     fail = True
                     break
                 module_shape = module.weight.shape
+                rank = None
                 if lora_A != None:
+                    rank = lora_A.shape[0] 
                     if module_shape[1] != v.shape[1]:
                         if ignore_model_variations:
                             skip = True
@@ -1128,6 +1115,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             fail = True
                         break
                 elif lora_B != None:
+                    rank = lora_B.shape[1] 
                     if module_shape[0] != v.shape[0]:
                         if ignore_model_variations:
                             skip = True
@@ -1147,6 +1135,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             fail = True
                         break
                 elif diff_b != None:
+                    rank = diff_b.shape[0] 
                     if module.bias == None:
                         msg = f"Lora '{path}': Lora Basis is defined while it doesnt exist in model '{_get_module_name(model)}'. It is likely this Lora has been made for another version of this model."
                         fail = True
@@ -1164,25 +1153,23 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                 
                 if not check_only:
                     loras_module_data = loras_model_data.get(module, None)
-                    if loras_module_data == None:
-                        pass
                     assert loras_module_data != None
                     loras_adapter_data =  loras_module_data.get(adapter_name, None)
-                    lora_A = None if lora_A == None else lora_A.to(module.weight.dtype) 
-                    lora_B = None if lora_B == None else lora_B.to(module.weight.dtype) 
-                    diff_b = None if diff_b == None else diff_b.to(module.weight.dtype) 
                     if loras_adapter_data == None:
-                        alpha = lora_alphas.get(k[:-len("lora_X.weight")] + "alpha", 1.) 
-                        loras_adapter_data = [lora_A, lora_B, diff_b, alpha]
+                        loras_adapter_data = [None, None, None, 1.]
                         loras_module_data[adapter_name] = loras_adapter_data
-                    elif lora_A != None:
-                        loras_adapter_data[0] = lora_A
+                    if lora_A != None:
+                        loras_adapter_data[0] = lora_A.to(module.weight.dtype) 
                     elif lora_B != None:
-                        loras_adapter_data[1] = lora_B
+                        loras_adapter_data[1] = lora_B.to(module.weight.dtype) 
                     else:
-                        loras_adapter_data[2] = diff_b
-            lora_A, lora_B, diff, diff_b, v, loras_module_data, loras_adapter_data = None, None, None, None, None, None, None
-            lora_alphas = None
+                        loras_adapter_data[2] = diff_b.to(module.weight.dtype) 
+                    if rank != None:
+                        alpha_key = k[:-len("lora_X.weight")] + "alpha"
+                        alpha = lora_alphas.get(alpha_key, None)
+                        alpha = 1. if alpha == None else alpha / rank  
+                        loras_adapter_data[3] = alpha
+            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = None
 
             if len(invalid_keys)  > 0:
                 msg = f"Lora '{path}' contains non Lora keys '{trunc(invalid_keys,200)}'"
@@ -1237,7 +1224,7 @@ def unload_loras_from_model(model):
     for _, v in model._loras_model_data.items():
         v.clear()
 
-    model._loras_active_adapters = set()
+    model._loras_active_adapters = []
     model._loras_scaling = dict()
     model._loras_tied_weights = dict()
     model._loras_errors = None
@@ -1248,7 +1235,7 @@ def unload_loras_from_model(model):
 def set_step_no_for_lora(model, step_no):
     model._lora_step_no = step_no
 
-def activate_loras(model, lora_nos, lora_multi = None ):
+def activate_loras(model, lora_nos, lora_multi = None):
     if not isinstance(lora_nos, list):
         lora_nos = [lora_nos]
     lora_nos = [str(l) for l in lora_nos]
@@ -1261,7 +1248,7 @@ def activate_loras(model, lora_nos, lora_multi = None ):
         lora_scaling_dict[no] = multi
 
     model._lora_step_no = 0    
-    model._loras_active_adapters = set(lora_nos)
+    model._loras_active_adapters = lora_nos
     model._loras_scaling = lora_scaling_dict 
 
 
@@ -1287,7 +1274,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         model_path = [model_path]
 
 
-    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") for file_name in model_path):
+    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") for file_name in model_path):
         raise Exception("full model path to file expected")
 
     model_path = [ _get_model(file) for file in model_path] 
@@ -1295,9 +1282,11 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         raise Exception("Unable to find file")
     
     verboseLevel = _compute_verbose_level(verboseLevel)
-
-    with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
-        metadata = f.metadata() 
+    if model_path[-1].endswith(".pt"):
+        metadata = None
+    else:
+        with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
+            metadata = f.metadata() 
 
     if metadata is None:
         transformer_config = None
@@ -1737,7 +1726,7 @@ class offload:
                     continue                     
                 key = adapter + '_GPU'
                 if to_GPU:
-                    lora_module[key] = [None if item == None else item.cuda(non_blocking=True) for item in lora_data[ :-1] ] + lora_data[ -1:]
+                    lora_module[key] = [None if item == None else item.cuda(non_blocking=True) for item in lora_data[ :-1] ] + lora_data[ -1:] 
                 elif key in lora_module:
                     del lora_module[key]
             
@@ -2015,7 +2004,7 @@ class offload:
         training = False
 
         dtype = weight.dtype 
-        if weight.shape[-1] < x.shape[-2] : # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+        if weight.shape[-1] < x.shape[-2]: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
             bias = submodule.bias
             original_bias = True
             if len(active_adapters) > 0:
@@ -2023,12 +2012,10 @@ class offload:
                     weight = weight.view(weight.shape) # get a persistent copy of the on the fly dequantized weights
                 else:
                     weight = weight.clone()
-
-
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
                     if data == None:
-                        continue
+                        continue                    
                     lora_A_weight, lora_B_weight, diff_b, alpha = data
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
                     if lora_A_weight != None:
@@ -2042,9 +2029,7 @@ class offload:
                             bias = bias.clone()
                             original_bias = False
                         bias.add_(diff_b, alpha=scaling)
-
                     # base_weight += scaling * lora_B_weight @ lora_A_weight
-
             if training:
                 pass
                 # result = torch.nn.functional.linear(dropout(x), base_weight, bias=submodule.bias)
@@ -2093,6 +2078,7 @@ class offload:
                 if len(loras_data) == 0:
                     return old_forward(*args, **kwargs)
                 else:
+                    # submodule.aaa = submodule_name
                     return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
             target_fn = lora_linear_forward
         else:
