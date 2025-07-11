@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.5.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.5.2 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -658,7 +658,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.2) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1500,7 +1500,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
 
     return
 
-def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None ):
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None, filter_sd =None ):
     """save the weights of a model and quantize them if requested
     These weights can be loaded again using 'load_model_data'
     """       
@@ -1541,6 +1541,24 @@ def save_model(model, file_path, do_quantize = False, quantizationType = qint8, 
     cache_ref = {}
     tied_weights_map = {}
     sd = model.state_dict()
+    if filter_sd  != None:
+        new_sd = {}
+        new_quantization_map = {}
+        for k_k, k_v  in filter_sd.items():
+            for s in [".weight", ".bias", ".weight._data", ".weight._scale"]:                
+                if k_k.endswith(s): 
+                    k_k= k_k[:-len(s)]
+                    break
+            for k,v in sd.items():
+                if k.startswith(k_k):
+                    new_sd[k] = v
+            if quantization_map != None:
+                for k,v in quantization_map.items():
+                    if k.startswith(k_k):
+                        new_quantization_map[k] = v
+        sd = new_sd
+        if quantization_map != None: quantization_map = new_quantization_map
+
     out_sd = OrderedDict()
 
 
