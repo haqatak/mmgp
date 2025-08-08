@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.5.3 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.5.7 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -121,8 +121,6 @@ class clock:
     
     def format_time_gap(self):
         return f"{self.stop_time - self.start_time:.2f}s"
-
-
 
 # useful functions to move a group of tensors (to design custom offload patches)
 def move_tensors(obj, device):
@@ -642,6 +640,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             else:
                 length = torch.numel(p.data) * p.data.element_size() 
                 p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
+
             tensor_no += 1
         del p
     del dummy_pinned_tensor
@@ -667,7 +666,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.3) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.7) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1145,6 +1144,8 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         break
                 elif diff_b != None:
                     rank = diff_b.shape[0] 
+                    if not hasattr(module, "bias"):
+                        pass
                     if module.bias == None:
                         msg = f"Lora '{path}': Lora Basis is defined while it doesnt exist in model '{_get_module_name(model)}'. It is likely this Lora has been made for another version of this model."
                         fail = True
@@ -1248,6 +1249,7 @@ def sync_models_loras(model, model2):
     model2._loras_scaling = model._loras_scaling 
 
 def unload_loras_from_model(model):
+    if model is None: return
     for _, v in model._loras_model_data.items():
         v.clear()
     for _, v in model._loras_model_shortcuts.items():
@@ -1291,7 +1293,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, modules = None,  return_shared_modules = None,  configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, modules = None,  return_shared_modules = None,  configKwargs ={}):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1379,13 +1381,13 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, modules = modules, return_shared_modules =  return_shared_modules, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  modules = None, return_shared_modules = None, verboseLevel = -1):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, modules = None, return_shared_modules = None, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -1502,6 +1504,9 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     full_state_dict, full_quantization_map, full_tied_weights_map = None, None, None
 
     # deal if we are trying to load just a sub part of a larger model
+    if preprocess_sd != None:
+        state_dict, quantization_map = preprocess_sd(state_dict, quantization_map)
+        
     if modelPrefix != None:
         base_model_prefix = modelPrefix + "."
         state_dict = filter_state_dict(state_dict,base_model_prefix)
@@ -2087,25 +2092,27 @@ class offload:
             if data == None:
                 continue
             diff_w , _ , diff_b, alpha = data
+            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
+            if scaling == 0:
+                continue
             if first_weight:
-                original_weight= weight.clone() if weight != None else None
+                original_weight= weight.clone() if weight is not None else None
                 first_weight = False
             if first_bias:
-                original_bias= bias.clone() if bias != None else None
+                original_bias= bias.clone() if bias is not None else None
                 first_bias = False
-            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
-            if diff_w != None:
+
+            if diff_w is not None:
                 weight.add_(diff_w, alpha= scaling)
                 diff_w = None
-            if diff_b != None:
+            if diff_b is not None:
                 bias.add_(diff_b, alpha= scaling)
                 diff_b = None
 
         ret = func(*args, **kwargs )
 
-        weight.data  = original_weight  if original_weight != None else None 
-        if original_bias != None:
-            bias.data = original_bias
+        if original_weight is not None: weight.data  = original_weight    
+        if original_bias is not None: bias.data = original_bias
 
         return ret
 
@@ -2131,6 +2138,8 @@ class offload:
                         continue                    
                     lora_A_weight, lora_B_weight, diff_b, alpha = data
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if scaling == 0:
+                        continue
                     if lora_A_weight != None:
                         weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
                     
@@ -2162,6 +2171,8 @@ class offload:
                     lora_A, lora_B, diff_b, alpha = data
                     # dropout = self.lora_dropout[active_adapter]
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if scaling == 0:
+                        continue
                     if lora_A == None:
                         result.add_(diff_b, alpha=scaling)
                     else:
@@ -2193,7 +2204,7 @@ class offload:
                 if len(loras_data) == 0:
                     return old_forward(*args, **kwargs)
                 else:
-                    # submodule.aaa = submodule_name
+                    submodule.aaa = submodule_name
                     return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
             target_fn = lora_linear_forward
         else:
@@ -2266,7 +2277,7 @@ class offload:
         setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
 
         
-    def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
+    def hook_change_module(self, target_module, model, model_id, module_id, previous_method, previous_method_name ):
         if hasattr(target_module, "_lock_dtype"):
             dtype = target_module._lock_dtype 
         else:
@@ -2279,11 +2290,12 @@ class offload:
                 args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
             return previous_method(*args, **kwargs) 
   
-        if hasattr(target_module, "_mm_id"):
+        if hasattr(target_module, "_mm_" + previous_method_name):
             return
-        setattr(target_module, "_mm_id", model_id)
+        setattr(target_module, "_mm_Id", model_id)
+        setattr(target_module, "_mm_" + previous_method_name, previous_method)
 
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
+        setattr(target_module, previous_method_name, functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
 
         if not self.verboseLevel >=1:
             return
@@ -2651,23 +2663,27 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre, None, num, False
                         cur_blocks_name = submodule_name
                         # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
-                          
- 
-            if hasattr(submodule, "forward"):
-                # if  any_lora and isinstance(submodule, ( torch.nn.Linear, torch.nn.Conv3d, torch.nn.LayerNorm)):
-                if  any_lora and  hasattr(submodule,"weight"):
+            top_submodule = len(submodule_name.split("."))==1
+            offload_hooks = submodule._offload_hooks if hasattr(submodule, "_offload_hooks") else [] 
+            if len(offload_hooks) > 0:
+                pass
+            assert top_submodule or len(offload_hooks) == 0, "custom offload hooks can only be set at the of the module"
+            submodule_method_names = ["forward"] +  offload_hooks
+            for submodule_method_name in submodule_method_names:
+                if not hasattr(submodule, submodule_method_name ): continue
+                if submodule_method_name == "forward" and any_lora and hasattr(submodule,"weight"):
                     submodule_method = self.hook_lora(submodule, current_model, model_id, loras_model_data, loras_model_shortcuts, submodule_name)                
                 else:
-                    submodule_method = getattr(submodule, "forward")
-                if callable(submodule_method):   
-                    if len(submodule_name.split("."))==1:
-                        self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method)
+                    submodule_method = getattr(submodule, submodule_method_name)
+                if callable(submodule_method):
+                    if top_submodule and cur_blocks_name is None:
+                        self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method, submodule_method_name)
                     elif compilationInThisOne and submodule in towers_modules: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
                         self.hook_check_empty_cache_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
-                
-                self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
+                    
+                    self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
 
 
         self.tune_preloading(model_id, current_budget, towers_names)
