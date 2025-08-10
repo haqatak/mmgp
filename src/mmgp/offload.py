@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.5.7 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.5.8 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -63,6 +63,11 @@ import json
 import psutil
 import builtins
 from accelerate import init_empty_weights
+
+import functools
+import types
+from functools import lru_cache
+import torch
 
 
 from mmgp import safetensors2
@@ -666,7 +671,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.7) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.8) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1757,6 +1762,7 @@ class offload:
         global last_offload_obj
         last_offload_obj = self
 
+        self._type_wrappers = {}
         
     def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name, submodule_name):
 
@@ -2204,7 +2210,7 @@ class offload:
                 if len(loras_data) == 0:
                     return old_forward(*args, **kwargs)
                 else:
-                    submodule.aaa = submodule_name
+                    #submodule.aaa = submodule_name # just for debugging if uncommented will cause pytorch recompilation
                     return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
             target_fn = lora_linear_forward
         else:
@@ -2236,10 +2242,63 @@ class offload:
 
         # need to be registered before the forward not to be break the efficiency of the compilation chain
         # it should be at the top of the compilation as this type of hook in the middle of a chain seems to break memory performance
-        target_module.register_forward_pre_hook(preload_blocks_for_compile)        
+        target_module.register_forward_pre_hook(preload_blocks_for_compile)
 
 
-    def hook_check_empty_cache_needed(self, target_module, model, model_id, blocks_name, previous_method,  context):
+
+
+    @torch._dynamo.disable
+    def _pre_check(self, module):
+        model_id    = getattr(module, "_mm_model_id", None)
+        blocks_name = getattr(module, "_mm_blocks_name", None)
+
+        self.ensure_model_loaded(model_id)
+        if blocks_name is None:
+            if self.ready_to_check_mem():
+                self.empty_cache_if_needed()
+        elif blocks_name != self.loaded_blocks[model_id] and \
+             blocks_name not in self.preloaded_blocks_per_model[model_id]:
+            self.gpu_load_blocks(model_id, blocks_name)
+
+    def _get_wrapper_for_type(self, mod_cls):
+        fn = self._type_wrappers.get(mod_cls)
+        if fn is not None:
+            return fn
+
+        # Unique function name per class -> unique compiled code object
+        fname = f"_mm_wrap_{mod_cls.__module__.replace('.', '_')}_{mod_cls.__name__}"
+
+        # Keep body minimal; all heavy/offload logic runs out-of-graph in _pre_check
+        # Include __TYPE_CONST in the code so the bytecode/consts differ per class.
+        src = f"""
+def {fname}(module, *args, **kwargs):
+    _ = __TYPE_CONST  # anchor type as a constant to make code object unique per class
+    mgr = module._mm_manager
+    mgr._pre_check(module)
+    return module._mm_forward(*args, **kwargs)
+"""
+        ns = {"__TYPE_CONST": mod_cls}
+        exec(src, ns)                   # compile a new function object/code object for this class
+        fn = ns[fname]
+        self._type_wrappers[mod_cls] = fn
+        return fn
+
+    def hook_check_load_into_GPU_if_needed(
+        self, target_module, model, model_id, blocks_name, previous_method, context
+    ):
+        # store instance data on the module (not captured by the wrapper)
+        target_module._mm_manager     = self
+        target_module._mm_model_id    = model_id
+        target_module._mm_blocks_name = blocks_name
+        target_module._mm_forward     = previous_method
+
+        # per-TYPE wrapper (unique bytecode per class, reused across instances of that class)
+        wrapper_fn = self._get_wrapper_for_type(type(target_module))
+
+        # bind as a bound method (no partial/closures)
+        target_module.forward = types.MethodType(wrapper_fn, target_module)
+
+    def hook_check_load_into_GPU_if_needed_default(self, target_module, model, model_id, blocks_name, previous_method,  context):
 
         dtype = model._dtype
         qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
@@ -2259,22 +2318,32 @@ class offload:
             target_module.forward = target_module._mm_forward
             return
 
-        def check_empty_cuda_cache(module, *args, **kwargs):
+        def check_load_into_GPU_needed():
             self.ensure_model_loaded(model_id)
             if blocks_name == None:
                 if self.ready_to_check_mem():
                     self.empty_cache_if_needed()
             elif blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
                 self.gpu_load_blocks(model_id, blocks_name)
-            if qint4quantization and dtype !=None:
-                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
+            # if qint4quantization and dtype !=None:
+            #     args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
 
-            return previous_method(*args, **kwargs) 
+        if isinstance(target_module, torch.nn.Linear):
+            def check_load_into_GPU_needed_linear(module, *args, **kwargs):
+                check_load_into_GPU_needed()
+                return previous_method(*args, **kwargs) 
+            check_load_into_GPU_needed_module = check_load_into_GPU_needed_linear
+        else:
+            def check_load_into_GPU_needed_other(module, *args, **kwargs):
+                check_load_into_GPU_needed()
+                return previous_method(*args, **kwargs) 
+            check_load_into_GPU_needed_module = check_load_into_GPU_needed_other
 
         setattr(target_module, "_mm_id", model_id)
         setattr(target_module, "_mm_forward", previous_method)
 
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_load_into_GPU_needed_module, target_module), previous_method) )
+        # target_module.register_forward_pre_hook(check_empty_cuda_cache)
 
         
     def hook_change_module(self, target_module, model, model_id, module_id, previous_method, previous_method_name ):
@@ -2300,7 +2369,7 @@ class offload:
         if not self.verboseLevel >=1:
             return
 
-        if module_id == None or module_id =='':
+        if previous_method_name =="forward" and (module_id == None or module_id ==''):
             model_name = model._get_name()
             print(f"Hooked to model '{model_id}' ({model_name})")
 
@@ -2607,19 +2676,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
         towers_names, towers_modules = _detect_main_towers(current_model)
-        # compile main iterative modules stacks ("towers")
         compilationInThisOne = compileAllModels or model_id in modelsToCompile 
-        if compilationInThisOne:
-            if self.verboseLevel>=1:
-                if len(towers_modules)>0:
-                    formated_tower_names = [name + '*' for name in towers_names]
-                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
-                else:
-                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
-
-            for submodel in towers_modules:
-                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
-                    #dynamic=True,
                 
         if pinAllModels or model_id in modelsToPin:
             if hasattr(current_model,"_already_pinned"):
@@ -2665,8 +2722,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                         # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
             top_submodule = len(submodule_name.split("."))==1
             offload_hooks = submodule._offload_hooks if hasattr(submodule, "_offload_hooks") else [] 
-            if len(offload_hooks) > 0:
-                pass
             assert top_submodule or len(offload_hooks) == 0, "custom offload hooks can only be set at the of the module"
             submodule_method_names = ["forward"] +  offload_hooks
             for submodule_method_name in submodule_method_names:
@@ -2681,10 +2736,26 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     elif compilationInThisOne and submodule in towers_modules: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
-                        self.hook_check_empty_cache_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
-                    
+                        if compilationInThisOne and False:
+                            self.hook_check_load_into_GPU_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+                        else:
+                            self.hook_check_load_into_GPU_if_needed_default(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+
                     self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
 
+
+        # compile main iterative modules stacks ("towers")
+        if compilationInThisOne:
+            if self.verboseLevel>=1:
+                if len(towers_modules)>0:
+                    formated_tower_names = [name + '*' for name in towers_names]
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
+                else:
+                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
+
+            for submodel in towers_modules:
+                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                    #dynamic=True,
 
         self.tune_preloading(model_id, current_budget, towers_names)
         self.parameters_ref  = {} 
