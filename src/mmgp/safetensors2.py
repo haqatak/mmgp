@@ -46,7 +46,16 @@ class MmapTracker:
         file_path = os.path.join(*s)
         self.file_path = file_path # os.path.abspath(file_path) 
         self.count = 0
-        mmm[file_path] = self
+        key = file_path
+        i = 1
+        while True:
+            if key not in mmm:
+                mmm[key] = self
+                break
+            i +=1
+            key = key + "#" + str(i)
+        self.mmm_key = key
+        # print(f"MMAP Add: {file_path}: {mmm.keys()}")
 
     def register(self, mmap_obj, map_id, start, size):
 
@@ -61,7 +70,8 @@ class MmapTracker:
 
                 print(f"MMap Manager of file '{self.file_path}' : MMap no {map_id} has been released" + text)
             if self.count == self._already_released:
-                del mmm[self.file_path]
+                # print(f"MMAP Del: {self.file_path}: {mmm.keys()}")
+                del mmm[self.mmm_key ]
 
             self._maps.pop(map_id, None)
 
@@ -240,7 +250,7 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None, extr
                         t = t.view(torch.uint16)
                     elif  dtype ==  torch.float8_e5m2 or dtype ==  torch.float8_e4m3fn:
                         t = t.view(torch.uint8)
-                    buffer = t.numpy().tobytes()
+                    buffer = t.cpu().numpy().tobytes()
                     bytes_written = writer.write(buffer)            
                     assert bytes_written == size                    
             i+=1

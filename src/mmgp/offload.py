@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.5.2 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.5.12 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -64,6 +64,10 @@ import psutil
 import builtins
 from accelerate import init_empty_weights
 
+import functools
+import types
+import torch
+
 
 from mmgp import safetensors2
 from mmgp import profile_type
@@ -84,6 +88,23 @@ class QEmbedding(QModuleMixin, torch.nn.Embedding):
 
 
 shared_state = {}
+
+def get_cache(cache_name):
+    all_cache = shared_state.get("_cache",  None)
+    if all_cache is None:
+        all_cache = {}
+        shared_state["_cache"]=  all_cache
+    cache = all_cache.get(cache_name, None)
+    if cache is None:
+        cache = {}
+        all_cache[cache_name] = cache
+    return cache
+
+def clear_caches():
+    all_cache = shared_state.get("_cache",  None)
+    if all_cache is not None:
+        all_cache.clear()
+
 
 mmm = safetensors2.mmm
 
@@ -121,8 +142,6 @@ class clock:
     
     def format_time_gap(self):
         return f"{self.stop_time - self.start_time:.2f}s"
-
-
 
 # useful functions to move a group of tensors (to design custom offload patches)
 def move_tensors(obj, device):
@@ -253,17 +272,17 @@ def _remove_model_wrapper(model):
 def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
     dtype= source_tensor.dtype
     shape = source_tensor.shape
-    if len(shape) == 0:
-        return source_tensor
-    else:                
+    if len(shape) > 0 :
         t = source_tensor.view(torch.uint8)
         t = torch.reshape(t, (length,))
-        # magic swap !
-        big_tensor[offset: offset + length] = t 
-        t = big_tensor[offset: offset + length]
-        t = t.view(dtype)
-        t = torch.reshape(t, shape)
-        assert t.is_pinned()
+    else:
+        t = source_tensor
+    # magic swap !
+    big_tensor[offset: offset + length] = t 
+    t = big_tensor[offset: offset + length]
+    t = t.view(dtype)
+    t = torch.reshape(t, shape)
+    assert t.is_pinned()
     return t
 
 def _safetensors_load_file(file_path, writable_tensors = True):
@@ -336,9 +355,8 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     names_list = sd_name if isinstance(sd, list) else [sd_name]
 
     if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
-
         if  verboseLevel>=1 :
-            print(f"Unable pin data of '{','.join(names_list)}' to reserved RAM as there is no reserved RAM left")
+            print(f"Unable to pin data of '{','.join(names_list)}' to reserved RAM as there is no reserved RAM left. Transfer speed from RAM to VRAM will may be slower.")
         return
 
     
@@ -404,7 +422,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
             big_tensors.append(current_big_tensor)
         except:
             incomplete_pinning = True
-            print(f"Unable to pin more tensors for '{sd_name}' as the maximum reservable memory has been reached ({total/ONE_MB:.2f})")
+            print(f"Unable to pin more tensors for '{sd_name}' as the maximum reservable memory has been reached ({total/ONE_MB:.2f}). Transfer speed from RAM to VRAM may be slower.")
             break
 
         last_big_tensor += 1
@@ -442,12 +460,12 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
 
     if verboseLevel >=1:
         if incomplete_pinning :
-            if len(names_list) > 0:
+            if len(names_list) > 1:
                 print(f"'{','.join(names_list)}' were partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
             else:
                 print(f"'{','.join(names_list)}' was partially pinned to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
         else:
-            if len(names_list) > 0:
+            if len(names_list) > 1:
                 print(f"'{','.join(names_list)}' were pinned entirely to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
             else:
                 print(f"'{','.join(names_list)}' was pinned entirely to reserved RAM: {last_big_tensor} large blocks spread across {total/ONE_MB:.2f} MB")
@@ -462,7 +480,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
 
         if  verboseLevel>=1 :
-            print(f"Unable pin data of '{model_id}' to reserved RAM as there is no reserved RAM left")
+            print(f"Unable to pin data of '{model_id}' to reserved RAM as there is no reserved RAM left. Transfer speed from RAM to VRAM may be slower.")
         return
     
     if partialPinning:
@@ -499,7 +517,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
         else:            
             print(f"Pinning data of '{model_id}' to reserved RAM")
 
-    if partialPinning and len(params_dict) == 0:
+    if len(params_dict) == 0:
         return
 
     ref_cache = {}
@@ -521,13 +539,22 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
         else:
             if isinstance(p, QTensor):
                 if p._qtype == qint4:
+                    if p._data._data.is_pinned():
+                        params_dict[n] = (None, False)
+                        continue
                     if hasattr(p,"_scale_shift"):
                         length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale_shift) * p._scale_shift.element_size() 
                     else:
                         length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale) * p._scale.element_size() + torch.numel(p._shift) * p._shift.element_size()                     
                 else:
                     length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
+                    if p._data.is_pinned():
+                        params_dict[n] = (None, False)
+                        continue
             else:
+                if p.data.is_pinned():
+                    params_dict[n] = (None, False)
+                    continue
                 length = torch.numel(p.data) * p.data.element_size() 
 
             ref_cache[ref] = (n, length)
@@ -544,7 +571,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             current_big_tensor_size += length
 
             total_tensor_bytes += length
-  
+    p = None
     if verboseLevel >=1 and tied_weights_count > 0:
         if  tied_weights_count == 1:
             print(f"Tied weights of {tied_weights_total/ONE_MB:0.2f} MB detected: {tied_weights_last}")
@@ -570,6 +597,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     tensor_no = 0
     # prev_big_tensor = 0
     for n, (p, is_buffer) in params_dict.items():
+        if p is None: continue
         q_name = tied_weights.get(n,None)
         if q_name != None:
             q , _ = params_dict[q_name] 
@@ -611,6 +639,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                 total += size
 
             current_big_tensor = big_tensors[big_tensor_no]
+
             if is_buffer :
                 _force_load_buffer(p) # otherwise potential memory leak
             if isinstance(p, QTensor):
@@ -633,6 +662,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             else:
                 length = torch.numel(p.data) * p.data.element_size() 
                 p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
+
             tensor_no += 1
         del p
     del dummy_pinned_tensor
@@ -658,7 +688,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.2) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.12) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1019,7 +1049,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
 
         if split_linear_modules_map != None:
             new_state_dict = dict()
-            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False)]
+            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False), (".lora_up.weight", -3, True), (".lora_down.weight", -3, False)]
             for module_name, module_data in state_dict.items():
                 name_parts = module_name.split(".")
                 for suffix, pos, any_split in suffixes: 
@@ -1068,10 +1098,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             invalid_keys = []
             unexpected_keys = []
             for k, v in state_dict.items():
-                lora_A = None
-                lora_B = None
-                diff_b = None
-                diff = None
+                lora_A = lora_B = diff_b = diff = lora_key = None
                 if k.endswith(".diff"):
                     diff = v
                     module_name = k[ : -5]
@@ -1136,6 +1163,8 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         break
                 elif diff_b != None:
                     rank = diff_b.shape[0] 
+                    if not hasattr(module, "bias"):
+                        pass
                     if module.bias == None:
                         msg = f"Lora '{path}': Lora Basis is defined while it doesnt exist in model '{_get_module_name(model)}'. It is likely this Lora has been made for another version of this model."
                         fail = True
@@ -1164,11 +1193,10 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         loras_adapter_data[1] = lora_B.to(module.weight.dtype) 
                     else:
                         loras_adapter_data[2] = diff_b.to(module.weight.dtype) 
-                    if rank != None:
-                        alpha_key = k[:-len("lora_X.weight")] + "alpha"
+                    if rank != None and lora_key is not None and "lora" in lora_key:
+                        alpha_key = k[:-len(lora_key)] + "alpha"
                         alpha = lora_alphas.get(alpha_key, None)
-                        alpha = 1. if alpha == None else alpha / rank  
-                        loras_adapter_data[3] = alpha
+                        if alpha is not None: loras_adapter_data[3] = alpha / rank 
             lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = None
 
             if len(invalid_keys)  > 0:
@@ -1220,8 +1248,29 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
         activate_loras(model, loras_nos, loras_multi)
     return new_lora_path
 
+
+def merge_dicts(A, B):
+    for key, value in A.items():
+        if isinstance(value, dict):
+            if key not in B or not isinstance(B[key], dict):
+                B[key] = value  # Copy entire dict reference from A
+            else:
+                merge_dicts(value, B[key])  # Recurse into both dicts
+        else:
+            B[key] = value  # Copy non-dict value from A to B
+
+
+def sync_models_loras(model, model2):
+    merge_dicts(model._loras_model_shortcuts , model2._loras_model_shortcuts)
+    model2._loras_active_adapters = model._loras_active_adapters 
+    model2._loras_adapters = model._loras_adapters
+    model2._loras_scaling = model._loras_scaling 
+
 def unload_loras_from_model(model):
+    if model is None: return
     for _, v in model._loras_model_data.items():
+        v.clear()
+    for _, v in model._loras_model_shortcuts.items():
         v.clear()
 
     model._loras_active_adapters = []
@@ -1262,7 +1311,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str, do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, modules = None,  return_shared_modules = None,  configKwargs ={}):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1274,7 +1323,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         model_path = [model_path]
 
 
-    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") for file_name in model_path):
+    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") or file_name.endswith(".ckpt") for file_name in model_path):
         raise Exception("full model path to file expected")
 
     model_path = [ _get_model(file) for file in model_path] 
@@ -1282,7 +1331,7 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
         raise Exception("Unable to find file")
     
     verboseLevel = _compute_verbose_level(verboseLevel)
-    if model_path[-1].endswith(".pt"):
+    if model_path[-1].endswith(".pt") or model_path[-1].endswith(".ckpt"):
         metadata = None
     else:
         with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
@@ -1331,42 +1380,36 @@ def fast_load_transformers_model(model_path: str, do_quantize = False, quantizat
             model = transfomer_class(config_obj)
                 
 
-    elif "_class_name" in transformer_config:
-        class_name = transformer_config["_class_name"]
-
+    else:
         if modelClass !=None:
             transfomer_class = modelClass
-        else:
+        elif "_class_name" in transformer_config:
+            class_name  = 'Transformer3DModel'
             module = __import__("diffusers")
             transfomer_class = getattr(module, class_name)
+        else:
+            raise Exception("class not defined")                
 
         with init_empty_weights():
             model = transfomer_class.from_config(transformer_config )
 
 
     torch.set_default_device('cpu')
+    model.eval().requires_grad_(False)
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors ,verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path: str, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  verboseLevel = -1):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, modules = None, return_shared_modules = None, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
-    if not isinstance(file_path, list):
-        file_path = [file_path]
 
-    file_path = [ _get_model(file) for file in file_path] 
-    if any( file == None for file in file_path):
-        raise Exception("Unable to find file")
-    verboseLevel = _compute_verbose_level(verboseLevel)
-
-    model = _remove_model_wrapper(model)
 
     def filter_state_dict(state_dict, base_model_prefix):
         new_state_dict= {}
@@ -1387,10 +1430,34 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             new_state_dict[k[ start:]] = v
         return new_state_dict
 
+
+
+    if not isinstance(file_path, list):
+        file_path = [file_path]
+
+    file_count =  len(file_path)
+    if isinstance(modules, (list,str)):
+        if isinstance(modules, str): modules = [modules]
+        file_path += modules
+        modules = None
+
+    file_path = [ _get_model(file) for file in file_path] 
+    if any( file == None for file in file_path):
+        raise Exception("Unable to find file")
+    verboseLevel = _compute_verbose_level(verboseLevel)
+
+    model = _remove_model_wrapper(model)
+
+    if return_shared_modules is not None:
+        return_state_dict ={}
+        return_quantization_map ={}
+        return_shared_modules["state_dict"] = return_state_dict 
+        return_shared_modules["quantization_map"] = return_quantization_map 
+
     full_quantization_map = {}
     full_tied_weights_map = {}
     full_state_dict = {}
-    for file in file_path:
+    for no, file in enumerate(file_path):
         quantization_map = None
         tied_weights_map = None
         if not (".safetensors" in file or ".sft" in file): 
@@ -1443,11 +1510,21 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             full_quantization_map.update(quantization_map)
         if tied_weights_map != None:
             full_tied_weights_map.update(tied_weights_map)
+        if return_shared_modules is not None and no >= file_count:
+            return_state_dict.update(state_dict)
+            if quantization_map is not None: return_quantization_map.update(quantization_map)
+
+    if isinstance(modules, dict) :
+        full_state_dict.update(modules["state_dict"])
+        full_quantization_map.update(modules["quantization_map"])
 
     state_dict, quantization_map, tied_weights_map  = full_state_dict, full_quantization_map, full_tied_weights_map
     full_state_dict, full_quantization_map, full_tied_weights_map = None, None, None
 
     # deal if we are trying to load just a sub part of a larger model
+    if preprocess_sd != None:
+        state_dict, quantization_map = preprocess_sd(state_dict, quantization_map)
+        
     if modelPrefix != None:
         base_model_prefix = modelPrefix + "."
         state_dict = filter_state_dict(state_dict,base_model_prefix)
@@ -1463,7 +1540,7 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
 
 
     missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
-    if len(missing_keys) > 0 :
+    if len(missing_keys) > 0  :
         # if there is a key mismatch maybe we forgot to remove some prefix
         base_model_prefix = None
         for k,v in state_dict.items():
@@ -1474,18 +1551,53 @@ def load_model_data(model, file_path: str, do_quantize = False, quantizationType
             raise Exception(f"Missing keys: {missing_keys}")
         state_dict = filter_state_dict(state_dict, base_model_prefix)
         missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
+        
     del state_dict
+
     if len(unexpected_keys) > 0 and verboseLevel >=2:
         print(f"Unexpected keys while loading '{file_path}': {unexpected_keys}")
 
     for k,p in model.named_parameters():
-        if p.is_meta:
+        if p.is_meta :
             txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since parameter '{k}' has no data"
             raise Exception(txt)
     for k,b in model.named_buffers():
-        if b.is_meta:
+        if b.is_meta :
             txt  = f"Incompatible State Dictionary or 'Init_Empty_Weights' not set since buffer '{k}' has no data"
             raise Exception(txt)
+        
+    if return_shared_modules is not None:
+        mods = { k : v for k,v in model.named_modules()}
+        return_parameters = {}
+        return_shared_modules["parameters"] = return_parameters
+        for k in return_state_dict:
+            if k.endswith("._data"):
+                k = k[:-6]
+            pos = k.rfind(".")
+            mod_name = k[:pos]
+            param_name =  k[pos +1:]
+            mod = mods.get(mod_name, None)
+            if mod is not None:
+                p =  mod._parameters.get(param_name, None)
+                if p is None: p =  mod._buffers.get(param_name, None)
+                if p is not None:
+                    return_parameters[k] = p
+        del mods
+        
+    if isinstance(modules, dict) :
+        mods = { k : v for k,v in model.named_modules()}
+        # replace Parameter outer shell so that both models parameters are tied
+        for k, rep_p in modules["parameters"].items():
+            pos = k.rfind(".")
+            mod_name = k[:pos]
+            param_name =  k[pos +1:]
+            mod = mods.get(mod_name, None)
+            if mod is not None:
+                setattr(mod, param_name, rep_p)
+        del mods 
+        modules["parameters"].clear()
+        modules["state_dict"].clear()
+        rep_p = p = None
 
     if do_quantize:
         if quantization_map != None and len(quantization_map) > 0 :
@@ -1544,7 +1656,7 @@ def save_model(model, file_path, do_quantize = False, quantizationType = qint8, 
     if filter_sd  != None:
         new_sd = {}
         new_quantization_map = {}
-        for k_k, k_v  in filter_sd.items():
+        for k_k in filter_sd:
             for s in [".weight", ".bias", ".weight._data", ".weight._scale"]:                
                 if k_k.endswith(s): 
                     k_k= k_k[:-len(s)]
@@ -1663,6 +1775,7 @@ class offload:
         global last_offload_obj
         last_offload_obj = self
 
+        self._type_wrappers = {}
         
     def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name, submodule_name):
 
@@ -1773,6 +1886,12 @@ class offload:
                         if tied_p.is_cuda:
                             setattr(parent_module, n , tied_p)
                             continue
+                    # if hasattr(p,'_data'):
+                    #     if not p._data.is_pinned() or not p._scale.is_pinned():
+                    #         pass
+                    # else:
+                    #     if  not p.data.is_pinned():
+                    #         pass
 
                     q = p.to("cuda", non_blocking=True)
                     if is_buffer:
@@ -1992,25 +2111,27 @@ class offload:
             if data == None:
                 continue
             diff_w , _ , diff_b, alpha = data
+            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
+            if scaling == 0:
+                continue
             if first_weight:
-                original_weight= weight.clone() if weight != None else None
+                original_weight= weight.clone() if weight is not None else None
                 first_weight = False
             if first_bias:
-                original_bias= bias.clone() if bias != None else None
+                original_bias= bias.clone() if bias is not None else None
                 first_bias = False
-            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
-            if diff_w != None:
+
+            if diff_w is not None:
                 weight.add_(diff_w, alpha= scaling)
                 diff_w = None
-            if diff_b != None:
+            if diff_b is not None:
                 bias.add_(diff_b, alpha= scaling)
                 diff_b = None
 
         ret = func(*args, **kwargs )
 
-        weight.data  = original_weight  if original_weight != None else None 
-        if original_bias != None:
-            bias.data = original_bias
+        if original_weight is not None: weight.data  = original_weight    
+        if original_bias is not None: bias.data = original_bias
 
         return ret
 
@@ -2036,6 +2157,8 @@ class offload:
                         continue                    
                     lora_A_weight, lora_B_weight, diff_b, alpha = data
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if scaling == 0:
+                        continue
                     if lora_A_weight != None:
                         weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
                     
@@ -2067,6 +2190,9 @@ class offload:
                     lora_A, lora_B, diff_b, alpha = data
                     # dropout = self.lora_dropout[active_adapter]
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                    if scaling == 0:
+                        continue
+
                     if lora_A == None:
                         result.add_(diff_b, alpha=scaling)
                     else:
@@ -2085,10 +2211,12 @@ class offload:
         return result
 
 
-    def hook_lora(self, submodule, current_model, model_id, loras_model_data, submodule_name):
+    def hook_lora(self, submodule, current_model, model_id, loras_model_data, loras_model_shortcuts, submodule_name):
         old_forward = submodule.forward
 
         loras_data = {}
+        assert submodule_name not in loras_model_shortcuts 
+        loras_model_shortcuts[submodule_name] = loras_data
         loras_model_data[submodule] = loras_data
 
         if isinstance(submodule,  torch.nn.Linear):
@@ -2096,7 +2224,7 @@ class offload:
                 if len(loras_data) == 0:
                     return old_forward(*args, **kwargs)
                 else:
-                    # submodule.aaa = submodule_name
+                    #submodule.aaa = submodule_name # just for debugging if uncommented will cause pytorch recompilation
                     return self._lora_linear_forward(current_model, submodule, loras_data,  *args, **kwargs)
             target_fn = lora_linear_forward
         else:
@@ -2128,10 +2256,63 @@ class offload:
 
         # need to be registered before the forward not to be break the efficiency of the compilation chain
         # it should be at the top of the compilation as this type of hook in the middle of a chain seems to break memory performance
-        target_module.register_forward_pre_hook(preload_blocks_for_compile)        
+        target_module.register_forward_pre_hook(preload_blocks_for_compile)
 
 
-    def hook_check_empty_cache_needed(self, target_module, model, model_id, blocks_name, previous_method,  context):
+
+
+    @torch._dynamo.disable
+    def _pre_check(self, module):
+        model_id    = getattr(module, "_mm_model_id", None)
+        blocks_name = getattr(module, "_mm_blocks_name", None)
+
+        self.ensure_model_loaded(model_id)
+        if blocks_name is None:
+            if self.ready_to_check_mem():
+                self.empty_cache_if_needed()
+        elif blocks_name != self.loaded_blocks[model_id] and \
+             blocks_name not in self.preloaded_blocks_per_model[model_id]:
+            self.gpu_load_blocks(model_id, blocks_name)
+
+    def _get_wrapper_for_type(self, mod_cls):
+        fn = self._type_wrappers.get(mod_cls)
+        if fn is not None:
+            return fn
+
+        # Unique function name per class -> unique compiled code object
+        fname = f"_mm_wrap_{mod_cls.__module__.replace('.', '_')}_{mod_cls.__name__}"
+
+        # Keep body minimal; all heavy/offload logic runs out-of-graph in _pre_check
+        # Include __TYPE_CONST in the code so the bytecode/consts differ per class.
+        src = f"""
+def {fname}(module, *args, **kwargs):
+    _ = __TYPE_CONST  # anchor type as a constant to make code object unique per class
+    mgr = module._mm_manager
+    mgr._pre_check(module)
+    return module._mm_forward(*args, **kwargs)
+"""
+        ns = {"__TYPE_CONST": mod_cls}
+        exec(src, ns)                   # compile a new function object/code object for this class
+        fn = ns[fname]
+        self._type_wrappers[mod_cls] = fn
+        return fn
+
+    def hook_check_load_into_GPU_if_needed(
+        self, target_module, model, model_id, blocks_name, previous_method, context
+    ):
+        # store instance data on the module (not captured by the wrapper)
+        target_module._mm_manager     = self
+        target_module._mm_model_id    = model_id
+        target_module._mm_blocks_name = blocks_name
+        target_module._mm_forward     = previous_method
+
+        # per-TYPE wrapper (unique bytecode per class, reused across instances of that class)
+        wrapper_fn = self._get_wrapper_for_type(type(target_module))
+
+        # bind as a bound method (no partial/closures)
+        target_module.forward = types.MethodType(wrapper_fn, target_module)
+
+    def hook_check_load_into_GPU_if_needed_default(self, target_module, model, model_id, blocks_name, previous_method,  context):
 
         dtype = model._dtype
         qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
@@ -2151,25 +2332,35 @@ class offload:
             target_module.forward = target_module._mm_forward
             return
 
-        def check_empty_cuda_cache(module, *args, **kwargs):
+        def check_load_into_GPU_needed():
             self.ensure_model_loaded(model_id)
             if blocks_name == None:
                 if self.ready_to_check_mem():
                     self.empty_cache_if_needed()
             elif blocks_name != self.loaded_blocks[model_id] and blocks_name not in self.preloaded_blocks_per_model[model_id]:
                 self.gpu_load_blocks(model_id, blocks_name)
-            if qint4quantization and dtype !=None:
-                args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
+            # if qint4quantization and dtype !=None:
+            #     args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
 
-            return previous_method(*args, **kwargs) 
+        if isinstance(target_module, torch.nn.Linear):
+            def check_load_into_GPU_needed_linear(module, *args, **kwargs):
+                check_load_into_GPU_needed()
+                return previous_method(*args, **kwargs) 
+            check_load_into_GPU_needed_module = check_load_into_GPU_needed_linear
+        else:
+            def check_load_into_GPU_needed_other(module, *args, **kwargs):
+                check_load_into_GPU_needed()
+                return previous_method(*args, **kwargs) 
+            check_load_into_GPU_needed_module = check_load_into_GPU_needed_other
 
         setattr(target_module, "_mm_id", model_id)
         setattr(target_module, "_mm_forward", previous_method)
 
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_empty_cuda_cache, target_module), previous_method) )
+        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_load_into_GPU_needed_module, target_module), previous_method) )
+        # target_module.register_forward_pre_hook(check_empty_cuda_cache)
 
         
-    def hook_change_module(self, target_module, model, model_id, module_id, previous_method):
+    def hook_change_module(self, target_module, model, model_id, module_id, previous_method, previous_method_name ):
         if hasattr(target_module, "_lock_dtype"):
             dtype = target_module._lock_dtype 
         else:
@@ -2182,16 +2373,17 @@ class offload:
                 args, kwargs = self.move_args_to_gpu(dtype, *args, **kwargs)
             return previous_method(*args, **kwargs) 
   
-        if hasattr(target_module, "_mm_id"):
+        if hasattr(target_module, "_mm_" + previous_method_name):
             return
-        setattr(target_module, "_mm_id", model_id)
+        setattr(target_module, "_mm_Id", model_id)
+        setattr(target_module, "_mm_" + previous_method_name, previous_method)
 
-        setattr(target_module, "forward", functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
+        setattr(target_module, previous_method_name, functools.update_wrapper(functools.partial(check_change_module, target_module), previous_method) )
 
         if not self.verboseLevel >=1:
             return
 
-        if module_id == None or module_id =='':
+        if previous_method_name =="forward" and (module_id == None or module_id ==''):
             model_name = model._get_name()
             print(f"Hooked to model '{model_id}' ({model_name})")
 
@@ -2206,7 +2398,6 @@ class offload:
 
         if current_budget == 0 or towers_names is None or len(towers_names) == 0 or not self.async_transfers:
             return
-        # current_budget = 5000 * ONE_MB
         base_size = self.blocks_of_modules_sizes[model_id] 
         current_budget -= base_size
         current_budget = max(0, current_budget)
@@ -2307,7 +2498,7 @@ class offload:
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -2316,6 +2507,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     budgets: 0 by default (unlimited). If non 0, it corresponds to the maximum size in MB that every model will occupy at any moment
         (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
         if pinnedMemory is not enabled
+    vram_safety_coefficient: float between 0 and 1 (exclusive), default 0.8. Sets the maximum portion of VRAM that can be used for models.
+        Lower values provide more safety margin but may reduce performance.        
     """
     self = offload()
     self.verboseLevel = verboseLevel
@@ -2331,7 +2524,11 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             return float(b[:-1]) * self.device_mem_capacity
         else:
             return b * ONE_MB
-        
+
+    # Validate vram_safety_coefficient
+    if not isinstance(vram_safety_coefficient, float) or vram_safety_coefficient <= 0 or vram_safety_coefficient >= 1:
+        raise ValueError("vram_safety_coefficient must be a float between 0 and 1 (exclusive)")
+
     budget = 0
     if not budgets is None:
         if isinstance(budgets , dict):
@@ -2476,14 +2673,14 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 model_budget =  new_budget if model_budget == 0 or new_budget < model_budget else model_budget
         if  model_budget > 0 and model_budget > current_model_size:
             model_budget = 0
-        coef =0.8
+        coef =vram_safety_coefficient
         if current_model_size > coef * self.device_mem_capacity and model_budget == 0 or model_budget > coef * self.device_mem_capacity:
             if verboseLevel >= 1:
                 if model_budget == 0:
-                    print(f"Model '{model_id}' is too large ({current_model_size/ONE_MB:0.1f} MB) to fit entirely in {coef * 100}% of the VRAM (max capacity is {coef * self.device_mem_capacity/ONE_MB}) MB)")
+                    print(f"Model '{model_id}' is too large ({current_model_size/ONE_MB:0.1f} MB) to fit entirely in {coef * 100:.0f}% of the VRAM (max capacity is {coef * self.device_mem_capacity/ONE_MB:0.1f}) MB)")
                 else:
                     print(f"Budget ({budget/ONE_MB:0.1f} MB) for Model '{model_id}' is too important so that this model can fit in the VRAM (max capacity is {self.device_mem_capacity/ONE_MB}) MB)")
-                print(f"Budget allocation for this model has been consequently reduced to the 80% of max GPU Memory ({coef * self.device_mem_capacity/ONE_MB:0.1f} MB). This may not leave enough working VRAM and you will probably need to define manually a lower budget for this model.")
+                print(f"Budget allocation for this model has been consequently reduced to the {coef * 100:.0f}% of max GPU Memory ({coef * self.device_mem_capacity/ONE_MB:0.1f} MB). This may not leave enough working VRAM and you will probably need to define manually a lower budget for this model.")
                 model_budget = coef * self.device_mem_capacity 
                 
         
@@ -2499,19 +2696,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
         towers_names, towers_modules = _detect_main_towers(current_model)
-        # compile main iterative modules stacks ("towers")
         compilationInThisOne = compileAllModels or model_id in modelsToCompile 
-        if compilationInThisOne:
-            if self.verboseLevel>=1:
-                if len(towers_modules)>0:
-                    formated_tower_names = [name + '*' for name in towers_names]
-                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
-                else:
-                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
-
-            for submodel in towers_modules:
-                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
-                    #dynamic=True,
                 
         if pinAllModels or model_id in modelsToPin:
             if hasattr(current_model,"_already_pinned"):
@@ -2519,14 +2704,29 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     print(f"Model '{model_id}' already pinned to reserved memory")
             else:
                 _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel)            
-    
+                # empty_tensor = torch.empty((1,))
+                # for sub_module_name, sub_module  in current_model.named_modules():
+                #     for k, p in  sub_module.named_parameters(recurse=False):
+                #         if p is not None:
+                #             if isinstance(p, QTensor):
+                #                 p._data.data = empty_tensor
+                #                 p._scale.data = empty_tensor
+                #             else:
+                #                 p.data = empty_tensor
+                #             del k
+                #     for k, v in  sub_module.named_buffers(recurse=False):
+                #         del k
+                # sub_module = None
+                # v = None
+                # gc.collect()
         current_budget = model_budgets[model_id]
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
         self.loaded_blocks[model_id] = None
         any_lora =  loras !=None and model_id in loras
         if any_lora: 
-            loras_model_data = {}
+            loras_model_data, loras_model_shortcuts = {}, {}
             current_model._loras_model_data = loras_model_data 
+            current_model._loras_model_shortcuts = loras_model_shortcuts
         for submodule_name, submodule in current_model.named_modules():  
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -2555,26 +2755,45 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                         cur_blocks_prefix, prev_blocks_name, cur_blocks_seq, is_mod_seq = pre, None, num, False
                         cur_blocks_name = submodule_name
                         # print(f"new block: {model_id}/{cur_blocks_name} - {submodule_name}")
-                          
- 
-            if hasattr(submodule, "forward"):
-                # if  any_lora and isinstance(submodule, ( torch.nn.Linear, torch.nn.Conv3d, torch.nn.LayerNorm)):
-                if  any_lora and  hasattr(submodule,"weight"):
-                    submodule_method = self.hook_lora(submodule, current_model, model_id, loras_model_data, submodule_name)                
+            top_submodule = len(submodule_name.split("."))==1
+            offload_hooks = submodule._offload_hooks if hasattr(submodule, "_offload_hooks") else [] 
+            assert top_submodule or len(offload_hooks) == 0, "custom offload hooks can only be set at the of the module"
+            submodule_method_names = ["forward"] +  offload_hooks
+            for submodule_method_name in submodule_method_names:
+                if not hasattr(submodule, submodule_method_name ): continue
+                if submodule_method_name == "forward" and any_lora and hasattr(submodule,"weight"):
+                    submodule_method = self.hook_lora(submodule, current_model, model_id, loras_model_data, loras_model_shortcuts, submodule_name)                
                 else:
-                    submodule_method = getattr(submodule, "forward")
-                if callable(submodule_method):   
-                    if len(submodule_name.split("."))==1:
-                        self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method)
+                    submodule_method = getattr(submodule, submodule_method_name)
+                if callable(submodule_method):
+                    if top_submodule and cur_blocks_name is None:
+                        self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method, submodule_method_name)
                     elif compilationInThisOne and submodule in towers_modules: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
-                        self.hook_check_empty_cache_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+                        if compilationInThisOne and False:
+                            self.hook_check_load_into_GPU_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+                        else:
+                            self.hook_check_load_into_GPU_if_needed_default(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
 
-                self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
+                    self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
 
+
+        # compile main iterative modules stacks ("towers")
+        if compilationInThisOne:
+            if self.verboseLevel>=1:
+                if len(towers_modules)>0:
+                    formated_tower_names = [name + '*' for name in towers_names]
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
+                else:
+                    print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
+
+            for submodel in towers_modules:
+                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                    #dynamic=True,
 
         self.tune_preloading(model_id, current_budget, towers_names)
+        self.parameters_ref  = {} 
 
 
     if self.verboseLevel >=2:
