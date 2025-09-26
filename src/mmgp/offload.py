@@ -71,6 +71,7 @@ import torch
 
 from mmgp import safetensors2
 from mmgp import profile_type
+from mmgp import device
 
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 
@@ -278,11 +279,12 @@ def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
     else:
         t = source_tensor
     # magic swap !
-    big_tensor[offset: offset + length] = t 
+    big_tensor[offset: offset + length] = t
     t = big_tensor[offset: offset + length]
     t = t.view(dtype)
     t = torch.reshape(t, shape)
-    assert t.is_pinned()
+    if device.can_pin_memory():
+        assert t.is_pinned()
     return t
 
 def _safetensors_load_file(file_path, writable_tensors = True):
@@ -351,6 +353,10 @@ def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
 def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
     global max_pinnable_bytes, total_pinned_bytes
 
+    if not device.can_pin_memory():
+        if verboseLevel >= 1:
+            print("Memory pinning is not supported on this device. Skipping.")
+        return
 
     names_list = sd_name if isinstance(sd, list) else [sd_name]
 
@@ -413,7 +419,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     except:
         print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less 0.3")
         gc.collect()
-        torch.cuda.empty_cache()
+        device.empty_cache()
         return
     
     for size in big_tensors_sizes:
@@ -455,7 +461,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     # global total_pinned_bytes
     # total_pinned_bytes += total
     gc.collect()
-    torch.cuda.empty_cache()
+    device.empty_cache()
 
 
     if verboseLevel >=1:
@@ -475,6 +481,11 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
 
 
 def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1):
+
+    if not device.can_pin_memory():
+        if verboseLevel >= 1:
+            print(f"Memory pinning of '{model_id}' is not supported on this device. Skipping.")
+        return
 
     global max_pinnable_bytes, total_pinned_bytes
     if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
@@ -686,9 +697,10 @@ welcome_displayed = False
 def _welcome():
     global welcome_displayed
     if welcome_displayed:
-         return 
+         return
     welcome_displayed = True
     print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.12) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"Detected device: {device.DEVICE_NAME.upper()}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -926,8 +938,8 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
 
 
     freeze(model_to_quantize)
-    torch.cuda.empty_cache()
-    gc.collect()       
+    device.empty_cache()
+    gc.collect()
 
     for tied_module, (tied_weight, src_module, src_weight) in tied_weights.items():  
         p = getattr(named_modules[src_module], src_weight)
@@ -1738,7 +1750,7 @@ def get_model_name(model):
 
 class HfHook:
     def __init__(self):
-        self.execution_device = "cuda"
+        self.execution_device = device.DEVICE_NAME
 
     def init_hook(self, module):
         return module
@@ -1760,14 +1772,14 @@ class offload:
         self.blocks_of_modules = {}
         self.blocks_of_modules_sizes = {}
         self.anyCompiledModule = False
-        self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
+        self.device_mem_capacity = device.get_total_memory(0)
         self.last_reserved_mem_check =0
         self.loaded_blocks = {}
         self.prev_blocks_names = {}
         self.next_blocks_names = {}
         self.preloaded_blocks_per_model = {}
-        self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
-        self.transfer_stream = torch.cuda.Stream()
+        self.default_stream = device.default_stream(device.DEVICE)
+        self.transfer_stream = device.Stream()
         self.async_transfers = False
         self.parameters_ref  = {} 
         self.max_reservable_memory = 0
@@ -1854,10 +1866,10 @@ class offload:
             for adapter in loras_active_adapters:
                 lora_data = lora_module.get(adapter, None)
                 if lora_data == None:
-                    continue                     
+                    continue
                 key = adapter + '_GPU'
                 if to_GPU:
-                    lora_module[key] = [None if item == None else item.cuda(non_blocking=True) for item in lora_data[ :-1] ] + lora_data[ -1:] 
+                    lora_module[key] = [None if item == None else item.to(device.DEVICE, non_blocking=device.is_cuda()) for item in lora_data[ :-1] ] + lora_data[ -1:]
                 elif key in lora_module:
                     del lora_module[key]
             
@@ -1877,13 +1889,13 @@ class offload:
             else:
                 loras_model_data =  getattr(model, "_loras_model_data", None)
 
-            with torch.cuda.stream(stream_to_use):
+            with device.stream(stream_to_use):
                 for param in blocks_params:
                     parent_module, n, p, is_buffer, tied_param = param
 
                     if tied_param != None:
-                        tied_p = getattr( tied_param[0], tied_param[1]) 
-                        if tied_p.is_cuda:
+                        tied_p = getattr( tied_param[0], tied_param[1])
+                        if tied_p.device.type == device.DEVICE_NAME:
                             setattr(parent_module, n , tied_p)
                             continue
                     # if hasattr(p,'_data'):
@@ -1893,7 +1905,7 @@ class offload:
                     #     if  not p.data.is_pinned():
                     #         pass
 
-                    q = p.to("cuda", non_blocking=True)
+                    q = p.to(device.DEVICE, non_blocking=device.is_cuda())
                     if is_buffer:
                         q = torch.nn.Buffer(q)
                     else:
@@ -1935,9 +1947,9 @@ class offload:
                         print(f"Preloading model {entry_name} ({model_name}) in GPU")
                     else:
                         print(f"Loading model {entry_name} ({model_name}) in GPU")
-                cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
+                cpu_to_gpu(device.current_stream(), self.blocks_of_modules[entry_name])
 
-            torch.cuda.synchronize()
+            device.synchronize()
 
             if next_blocks_entry != None:
                 if self.verboseLevel >=2:
@@ -1948,7 +1960,7 @@ class offload:
             if self.verboseLevel >=2:
                 print(f"Loading model {entry_name} ({model_name}) in GPU")
             cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
-            torch.cuda.synchronize()
+            device.synchronize()
         if not preload:
             self.loaded_blocks[model_id] = blocks_name           
 
@@ -2019,13 +2031,13 @@ class offload:
                 next_blocks_entry = self.next_blocks_names[entry_name] if entry_name in self.next_blocks_names else None
                 if next_blocks_entry != None:
                     pos = next_blocks_entry.rfind("/")
-                    torch.cuda.synchronize()
-                    self.gpu_unload_blocks(model_id, next_blocks_entry[pos+1:])      
-                self.loaded_blocks[model_id] = None  
- 
+                    device.synchronize()
+                    self.gpu_unload_blocks(model_id, next_blocks_entry[pos+1:])
+                self.loaded_blocks[model_id] = None
+
         self.active_models = []
         self.active_models_ids = []
-        torch.cuda.empty_cache()
+        device.empty_cache()
         gc.collect()
         self.last_reserved_mem_check = time.time()
 
@@ -2034,21 +2046,21 @@ class offload:
         new_kwargs={}
 
         for arg in args:
-            if torch.is_tensor(arg):    
+            if torch.is_tensor(arg):
                 if arg.dtype == torch.float32:
-                    arg = arg.to(dtype).cuda(non_blocking=True)
-                elif not arg.is_cuda:
-                    arg = arg.cuda(non_blocking=True)
+                    arg = arg.to(dtype).to(device.DEVICE, non_blocking=device.is_cuda())
+                elif arg.device.type != device.DEVICE_NAME:
+                    arg = arg.to(device.DEVICE, non_blocking=device.is_cuda())
             new_args.append(arg)
         for k in kwargs:
             arg = kwargs[k]
             if torch.is_tensor(arg):
                 if arg.dtype == torch.float32:
-                    arg = arg.to(dtype).cuda(non_blocking=True)             
-                elif not arg.is_cuda:
-                    arg = arg.cuda(non_blocking=True)             
+                    arg = arg.to(dtype).to(device.DEVICE, non_blocking=device.is_cuda())
+                elif arg.device.type != device.DEVICE_NAME:
+                    arg = arg.to(device.DEVICE, non_blocking=device.is_cuda())
             new_kwargs[k]= arg
-        
+
         return new_args, new_kwargs
 
     def ready_to_check_mem(self):
@@ -2063,16 +2075,16 @@ class offload:
 
 
     def empty_cache_if_needed(self):
-        mem_reserved = torch.cuda.memory_reserved()
+        mem_reserved = device.memory_reserved()
         mem_threshold = 0.9*self.device_mem_capacity
-        if mem_reserved >= mem_threshold:            
-            mem_allocated = torch.cuda.memory_allocated()
-            if mem_allocated <= 0.70 * mem_reserved: 
+        if mem_reserved >= mem_threshold:
+            mem_allocated = device.memory_allocated()
+            if mem_allocated <= 0.70 * mem_reserved:
                 # print(f"Cuda empty cache triggered as Allocated Memory ({mem_allocated/1024000:0f} MB) is lot less than Cached Memory ({mem_reserved/1024000:0f} MB)  ")
-                torch.cuda.empty_cache()
+                device.empty_cache()
                 tm= time.time()
                 if self.verboseLevel >=2:
-                    print(f"Empty Cuda cache at {tm}")
+                    print(f"Empty {device.DEVICE_NAME.upper()} cache at {tm}")
                 # print(f"New cached memory after purge is {torch.cuda.memory_reserved()/1024000:0f} MB)  ")
 
 
@@ -2490,10 +2502,10 @@ def {fname}(module, *args, **kwargs):
                 unload_loras_from_model(model)
             model = None
 
-        self.models = None            
+        self.models = None
 
         gc.collect()
-        torch.cuda.empty_cache()
+        device.empty_cache()
 
 
 
@@ -2537,16 +2549,18 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         else:
             budget = get_parsed_budget(budget) 
 
-    self.async_transfers = asyncTransfers
+    self.async_transfers = asyncTransfers and device.is_cuda()
+
+    if not self.async_transfers and asyncTransfers and verboseLevel >= 1:
+        print("Async transfers are only supported on CUDA devices. Disabling.")
 
 
-
-    torch.set_default_device('cpu')
+    device.set_default_device('cpu')
 
     if hasattr(pipe_or_dict_of_modules, "components"):
         # create a fake Accelerate parameter so that lora loading doesn't change the device
-        pipe_or_dict_of_modules.hf_device_map = torch.device("cuda")
-        pipe_or_dict_of_modules= pipe_or_dict_of_modules.components 
+        pipe_or_dict_of_modules.hf_device_map = device.DEVICE
+        pipe_or_dict_of_modules= pipe_or_dict_of_modules.components
 
     
     models = {k: _remove_model_wrapper(v) for k, v in pipe_or_dict_of_modules.items() if isinstance(v, torch.nn.Module)}
@@ -2572,21 +2586,33 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     pinAllModels = False
     if isinstance(pinnedMemory, bool):
         pinAllModels = pinnedMemory
-    elif isinstance(pinnedMemory, list):            
+    elif isinstance(pinnedMemory, list):
         modelsToPin = pinnedMemory
     else:
         modelsToPin = [pinnedMemory]
+
+    if not device.can_pin_memory() and (pinAllModels or len(modelsToPin) > 0):
+        if verboseLevel >= 1:
+            print("Memory pinning is not supported on this device. Disabling.")
+        pinAllModels = False
+        modelsToPin = []
 
     modelsToCompile = []
     compileAllModels = False
     if isinstance(compile, bool):
         compileAllModels = compile
-    elif isinstance(compile, list):            
+    elif isinstance(compile, list):
         modelsToCompile = compile
     else:
         modelsToCompile = [compile]
 
-    self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
+    if (compileAllModels or len(modelsToCompile) > 0) and not device.is_cuda():
+        if verboseLevel >= 1:
+            print("Compilation is only supported on CUDA devices. Disabling.")
+        compileAllModels = False
+        modelsToCompile = []
+
+    self.anyCompiledModule = compileAllModels or len(modelsToCompile) > 0
     if self.anyCompiledModule:
         torch.compiler.reset()
         torch._dynamo.config.cache_size_limit = 10000
@@ -2820,9 +2846,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             print_size_range(prev_pre,start_num,prev_num, prev_size )
 
   
-    torch.set_default_device('cuda')
-    torch.cuda.empty_cache()
-    gc.collect()         
+    device.set_default_device(device.DEVICE_NAME)
+    device.empty_cache()
+    gc.collect()
 
     return self
 
@@ -2874,7 +2900,7 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         budgets["transformer"] = 1200    
 
     extraModelsToQuantize = None
-    asyncTransfers = True
+    asyncTransfers = device.is_cuda()
 
     if profile_no == profile_type.HighRAM_HighVRAM:
         pinnedMemory= True
@@ -2899,8 +2925,8 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
         extraModelsToQuantize = default_extraModelsToQuantize
         budgets["*"] =  3000
         if "transformer" in modules:
-            budgets["transformer"] = 400    
-        #asyncTransfers = False
+            budgets["transformer"] = 400
+        asyncTransfers = False
         # info = "You have chosen the slowest profile that may require 24 GB of RAM and up to 10 GB of VRAM on some applications."
     else:
         raise Exception("Unknown profile")
