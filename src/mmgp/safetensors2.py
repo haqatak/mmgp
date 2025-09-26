@@ -475,10 +475,11 @@ class _SafeTensorLoader:
         pass
 
 
-def safe_open(filename: str, framework: str = "pt",device = "cpu", writable_tensors = True) -> _SafeTensorLoader:
-    if device != "cpu" or framework !="pt":
-        return _old_safe_open(filename =filename, framework=framework, device=device)
-    return _SafeTensorLoader(filename, writable_tensors = writable_tensors)
+def safe_open(filename: str, framework: str = "pt", device="cpu", writable_tensors=True) -> "_SafeTensorLoader":
+    device_type = device.type if isinstance(device, torch.device) else device
+    if device_type != "cpu" or framework != "pt":
+        return _old_safe_open(filename=filename, framework=framework, device=device)
+    return _SafeTensorLoader(filename, writable_tensors=writable_tensors)
 
 def torch_load_file( filename, device = 'cpu', writable_tensors = True) -> Dict[str, torch.Tensor]:
     sd = {}
